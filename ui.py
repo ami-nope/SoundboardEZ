@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from pathlib import Path
-import random
 import shutil
 import subprocess
 import sys
@@ -19,6 +18,7 @@ from PyQt6.QtCore import (
     QEvent,
     QEasingCurve,
     QObject,
+    QPoint,
     QPointF,
     QRect,
     QRectF,
@@ -29,10 +29,11 @@ from PyQt6.QtCore import (
     QPropertyAnimation,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QBrush, QLinearGradient, QPainter, QPen
+from PyQt6.QtGui import QColor, QBrush, QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -49,6 +50,8 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSpacerItem,
     QSizePolicy,
     QSlider,
     QStyle,
@@ -502,54 +505,91 @@ class ButtonMotionFilter(QObject):
 
 
 class LocalTileDelegate(QStyledItemDelegate):
+    @staticmethod
+    def _toggle_check_state(model, index) -> None:
+        state = index.data(int(Qt.ItemDataRole.CheckStateRole))
+        checked = state == Qt.CheckState.Checked
+        next_state = Qt.CheckState.Unchecked if checked else Qt.CheckState.Checked
+        model.setData(index, next_state, int(Qt.ItemDataRole.CheckStateRole))
+
+    def editorEvent(self, event, model, option, index) -> bool:  # type: ignore[override]
+        if not (index.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+            return super().editorEvent(event, model, option, index)
+
+        typ = event.type()
+        if typ in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+            button = getattr(event, "button", lambda: Qt.MouseButton.NoButton)()
+            if button != Qt.MouseButton.LeftButton:
+                return False
+            pos = getattr(event, "position", None)
+            if pos is None:
+                return False
+            point = pos().toPoint()
+            tile_rect = option.rect.adjusted(8, 8, -8, -8)
+            if not tile_rect.contains(point):
+                return False
+            if typ == QEvent.Type.MouseButtonRelease:
+                self._toggle_check_state(model, index)
+            return True
+
+        if typ == QEvent.Type.KeyPress:
+            key = getattr(event, "key", lambda: 0)()
+            if key in (int(Qt.Key.Key_Space), int(Qt.Key.Key_Return), int(Qt.Key.Key_Enter)):
+                self._toggle_check_state(model, index)
+                return True
+
+        return super().editorEvent(event, model, option, index)
+
     def paint(self, painter: QPainter, option, index) -> None:  # type: ignore[override]
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         rect = option.rect.adjusted(8, 8, -8, -8)
-        colors = index.data(int(Qt.ItemDataRole.UserRole))
-        if not (isinstance(colors, tuple) and len(colors) == 2):
-            colors = ("#4f46e5", "#3730a3")
-        c1 = QColor(colors[0])
-        c2 = QColor(colors[1])
-
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
-        if hovered:
-            c1 = c1.lighter(132)
-            c2 = c2.lighter(132)
-
-        shadow_rect = rect.adjusted(1, 2, 1, 3)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(7, 14, 31, 105 if hovered else 82))
-        painter.drawRoundedRect(shadow_rect, 19, 19)
-
-        grad = QLinearGradient(float(rect.left()), float(rect.top()), float(rect.right()), float(rect.bottom()))
-        grad.setColorAt(0.0, c1)
-        grad.setColorAt(1.0, c2)
-        painter.setBrush(QBrush(grad))
-
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        border_color = QColor(255, 255, 255, 238) if selected else QColor(196, 214, 255, 98)
+        checked = index.data(int(Qt.ItemDataRole.CheckStateRole)) == Qt.CheckState.Checked
+
+        base_color = QColor("#334155")
+        if hovered:
+            base_color = QColor("#3f4f66")
+        if selected:
+            base_color = QColor("#425a76")
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(2, 8, 23, 76))
+        painter.drawRoundedRect(rect.adjusted(0, 1, 0, 1), 14, 14)
+
+        border_color = QColor("#475569")
         border_width = 2 if (selected or hovered) else 1
+        if hovered and not selected:
+            border_color = QColor(56, 189, 248, 125)
+        if selected:
+            border_color = QColor(56, 189, 248, 225)
+
+        painter.setBrush(base_color)
         pen = QPen(border_color, border_width)
         painter.setPen(pen)
-        painter.drawRoundedRect(rect, 18, 18)
+        painter.drawRoundedRect(rect, 14, 14)
+
+        if hovered or selected:
+            glow_alpha = 28 if hovered else 42
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(56, 189, 248, glow_alpha))
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 13, 13)
 
         text = str(index.data(int(Qt.ItemDataRole.DisplayRole)) or "")
         text_rect = rect.adjusted(10, 0, -10, 0)
         text = option.fontMetrics.elidedText(text, Qt.TextElideMode.ElideRight, text_rect.width())
-        painter.setPen(QColor("#f8fbff"))
+        painter.setPen(QColor("#e2e8f0"))
         painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignCenter), text)
 
         if index.flags() & Qt.ItemFlag.ItemIsUserCheckable:
-            state = index.data(int(Qt.ItemDataRole.CheckStateRole))
-            checked = state == Qt.CheckState.Checked
             check_rect = QRect(rect.right() - 20, rect.top() + 6, 12, 12)
-            painter.setBrush(QColor(255, 255, 255, 230) if checked else QColor(255, 255, 255, 125))
-            painter.setPen(QPen(QColor(255, 255, 255, 210), 1))
+            painter.setBrush(QColor("#38bdf8") if checked else QColor("#64748b"))
+            painter.setPen(QPen(QColor("#cbd5e1"), 1))
             painter.drawEllipse(check_rect)
             if checked:
-                painter.setPen(QPen(QColor(30, 41, 59), 2))
+                painter.setPen(QPen(QColor("#0f172a"), 2))
                 painter.drawLine(check_rect.left() + 3, check_rect.center().y(), check_rect.left() + 5, check_rect.bottom() - 3)
                 painter.drawLine(check_rect.left() + 5, check_rect.bottom() - 3, check_rect.right() - 2, check_rect.top() + 3)
 
@@ -653,19 +693,13 @@ class TrimTimelineWidget(QWidget):
 
         outer = self.rect().adjusted(1, 1, -1, -1)
         outer_f = QRectF(float(outer.left()), float(outer.top()), float(outer.width()), float(outer.height()))
-        bg_grad = QLinearGradient(outer_f.left(), outer_f.top(), outer_f.right(), outer_f.bottom())
-        bg_grad.setColorAt(0.0, QColor(17, 35, 80, 200))
-        bg_grad.setColorAt(1.0, QColor(8, 16, 44, 235))
-        painter.setBrush(QBrush(bg_grad))
-        painter.setPen(QPen(QColor(173, 210, 255, 110), 1))
+        painter.setBrush(QColor("#1e293b"))
+        painter.setPen(QPen(QColor("#334155"), 1))
         painter.drawRoundedRect(outer_f, 14, 14)
 
         track = self._track_rect()
-        track_grad = QLinearGradient(track.left(), track.top(), track.left(), track.bottom())
-        track_grad.setColorAt(0.0, QColor(36, 72, 140, 125))
-        track_grad.setColorAt(1.0, QColor(16, 33, 82, 160))
-        painter.setBrush(QBrush(track_grad))
-        painter.setPen(QPen(QColor(153, 184, 255, 95), 1))
+        painter.setBrush(QColor("#0f172a"))
+        painter.setPen(QPen(QColor("#334155"), 1))
         painter.drawRoundedRect(track, 10, 10)
 
         bar_count = max(32, int(track.width() / 7))
@@ -675,8 +709,8 @@ class TrimTimelineWidget(QWidget):
             x = track.left() + (t * track.width())
             wave = 0.15 + (abs(math.sin((t * 9.6) + 0.6)) * 0.85)
             amp = (track.height() * wave) * 0.5
-            alpha = 55 + int(80 * wave)
-            painter.setPen(QPen(QColor(120, 170, 255, alpha), 2))
+            alpha = 45 + int(55 * wave)
+            painter.setPen(QPen(QColor(71, 85, 105, alpha), 2))
             painter.drawLine(QPointF(x, center_y - amp), QPointF(x, center_y + amp))
 
         start_x = self._ms_to_x(self._start_ms)
@@ -684,10 +718,7 @@ class TrimTimelineWidget(QWidget):
         play_x = self._ms_to_x(self._playhead_ms)
 
         selection = QRectF(start_x, track.top(), max(2.0, end_x - start_x), track.height())
-        sel_grad = QLinearGradient(selection.left(), selection.top(), selection.right(), selection.bottom())
-        sel_grad.setColorAt(0.0, QColor(42, 212, 255, 95))
-        sel_grad.setColorAt(1.0, QColor(64, 120, 255, 105))
-        painter.setBrush(QBrush(sel_grad))
+        painter.setBrush(QColor(56, 189, 248, 48))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(selection, 8, 8)
 
@@ -696,19 +727,19 @@ class TrimTimelineWidget(QWidget):
             pin_bottom = track.bottom() + 8.0
             painter.setPen(QPen(color, 2.2))
             painter.drawLine(QPointF(x_pos, pin_top + 4.0), QPointF(x_pos, pin_bottom))
-            painter.setBrush(QBrush(color.lighter(120)))
-            painter.setPen(QPen(QColor(244, 251, 255, 220), 1))
+            painter.setBrush(QBrush(color))
+            painter.setPen(QPen(QColor("#cbd5e1"), 1))
             painter.drawEllipse(QPointF(x_pos, pin_top), 5.5, 5.5)
 
-        draw_pin(start_x, QColor(52, 211, 153))
-        draw_pin(end_x, QColor(248, 113, 113))
-        painter.setPen(QPen(QColor(236, 245, 255, 230), 1.8))
+        draw_pin(start_x, QColor("#38bdf8"))
+        draw_pin(end_x, QColor("#7dd3fc"))
+        painter.setPen(QPen(QColor("#e2e8f0"), 1.8))
         painter.drawLine(QPointF(play_x, track.top() - 7.0), QPointF(play_x, track.bottom() + 7.0))
-        painter.setBrush(QBrush(QColor(236, 245, 255, 235)))
+        painter.setBrush(QBrush(QColor("#e2e8f0")))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(QPointF(play_x, track.top() - 7.0), 4.0, 4.0)
 
-        painter.setPen(QColor(221, 233, 255, 220))
+        painter.setPen(QColor("#cbd5e1"))
         painter.drawText(
             QRectF(track.left(), outer_f.top() + 2.0, track.width(), 16.0),
             int(Qt.AlignmentFlag.AlignCenter),
@@ -847,21 +878,19 @@ class TrimEditorDialog(QDialog):
         self.setStyleSheet(
             """
             QDialog#TrimEditorDialog {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(13, 27, 66, 245),
-                    stop:1 rgba(8, 17, 44, 250));
-                border: 1px solid rgba(160, 193, 255, 0.45);
-                border-radius: 16px;
+                background: rgba(22, 33, 50, 242);
+                border: 1px solid rgba(148, 163, 184, 42);
+                border-radius: 20px;
             }
             QDialog#TrimEditorDialog QLabel#TrimTarget {
-                font-size: 14px;
-                font-weight: 700;
-                color: #eff6ff;
+                font-size: 15px;
+                font-weight: 600;
+                color: #edf3fb;
             }
             QDialog#TrimEditorDialog QLabel#TrimTime {
                 font-size: 13px;
-                font-weight: 700;
-                color: #d5e4ff;
+                font-weight: 600;
+                color: #bfd0e4;
                 padding-right: 2px;
             }
             """
@@ -871,14 +900,61 @@ class TrimEditorDialog(QDialog):
         self.closed.emit()
         super().closeEvent(event)
 
+
+class FramelessImporterDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._dragging = False
+        self._drag_offset = QPoint()
+
+    @staticmethod
+    def _is_drag_exempt_widget(widget: QWidget | None) -> bool:
+        current = widget
+        while current is not None:
+            if isinstance(
+                current,
+                (QPushButton, QLineEdit, QComboBox, QSlider, QListWidget, QAbstractItemView, QScrollArea),
+            ):
+                return True
+            current = current.parentWidget()
+        return False
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        child = self.childAt(event.position().toPoint())
+        if self._is_drag_exempt_widget(child):
+            super().mousePressEvent(event)
+            return
+        self._dragging = True
+        self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._dragging and (event.buttons() & Qt.MouseButton.LeftButton):
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        self._dragging = False
+        super().mouseReleaseEvent(event)
+
+
 class SoundboardWindow(QMainWindow):
     DEFAULT_KEYS = list("1234567890qwertyuiopasdfghjklzxcvbnm")
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("SoundboardEZ")
-        base_h = 760
-        self.resize(int(base_h * PHI), base_h)
+        self.resize(920, 520)
+        self.setMinimumSize(920, 520)
 
         self.sounds_dir = Path("sounds")
         self._local_all_items: list[str] = []
@@ -913,6 +989,7 @@ class SoundboardWindow(QMainWindow):
         self._trim_play_timer.setInterval(80)
         self._trim_play_timer.timeout.connect(self._sync_trim_playhead)
         self._ui_animations: list[QPropertyAnimation] = []
+        self._soundboard_initialized = False
 
         self.engine = AudioEngine(
             samplerate=48000,
@@ -924,22 +1001,25 @@ class SoundboardWindow(QMainWindow):
         self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
         self._engine_thread.start()
 
-        self._button_motion = ButtonMotionFilter(self)
-
         central = QWidget()
         central.setObjectName("Root")
         self.setCentralWidget(central)
-        grid = QGridLayout(central)
-        grid.setContentsMargins(18, 14, 18, 14)
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(12)
-        grid.setRowStretch(1, 1)
+        root_layout = QHBoxLayout(central)
+        root_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout.setSpacing(16)
+
+        self.main_content = QWidget()
+        self.main_content.setObjectName("MainContent")
+        self.main_content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        main_column_layout = QVBoxLayout(self.main_content)
+        main_column_layout.setContentsMargins(0, 0, 0, 0)
+        main_column_layout.setSpacing(16)
 
         self.top_bar = QFrame()
         self.top_bar.setObjectName("TopBar")
         top_layout = QHBoxLayout(self.top_bar)
-        top_layout.setContentsMargins(16, 10, 16, 10)
-        top_layout.setSpacing(10)
+        top_layout.setContentsMargins(16, 16, 16, 16)
+        top_layout.setSpacing(16)
         self.app_logo = QLabel("SB")
         self.app_logo.setObjectName("LogoBadge")
         self.app_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -954,26 +1034,46 @@ class SoundboardWindow(QMainWindow):
         title_col.addWidget(self.app_subtitle)
         self.status_label = QLabel("Ready")
         self.status_label.setObjectName("StatusPill")
+        self.route_status_label = QLabel("Hosted On: detecting... | Mic: detecting...")
+        self.route_status_label.setObjectName("RoutePill")
+        self.route_status_label.setMinimumWidth(0)
+        self.route_status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        state_col = QVBoxLayout()
+        state_col.setContentsMargins(0, 0, 0, 0)
+        state_col.setSpacing(8)
+        state_col.addWidget(self.status_label, 0, Qt.AlignmentFlag.AlignRight)
+        state_col.addWidget(self.route_status_label, 0, Qt.AlignmentFlag.AlignRight)
         top_layout.addWidget(self.app_logo)
         top_layout.addLayout(title_col)
         top_layout.addStretch(1)
-        top_layout.addWidget(self.status_label, 0, Qt.AlignmentFlag.AlignVCenter)
-        grid.addWidget(self.top_bar, 0, 0)
+        top_layout.addLayout(state_col)
+        main_column_layout.addWidget(self.top_bar)
 
-        self.left_group = QGroupBox("Importer")
+        self.left_group = QGroupBox("")
         self.left_group.setObjectName("ImporterCard")
-        self.left_group.setMinimumWidth(430)
-        self.left_group.setMaximumWidth(500)
-        left_layout = QGridLayout(self.left_group)
-        left_layout.setContentsMargins(14, 18, 14, 12)
-        left_layout.setHorizontalSpacing(8)
-        left_layout.setVerticalSpacing(8)
+        self.left_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.left_group.setMinimumHeight(300)
+        left_outer_layout = QVBoxLayout(self.left_group)
+        left_outer_layout.setContentsMargins(0, 0, 0, 0)
+        left_outer_layout.setSpacing(0)
+        self.importer_scroll = QScrollArea()
+        self.importer_scroll.setObjectName("ImporterScroll")
+        self.importer_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.importer_scroll.setWidgetResizable(True)
+        self.importer_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.importer_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.importer_content = QWidget()
+        self.importer_content.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        left_layout = QVBoxLayout(self.importer_content)
+        left_layout.setContentsMargins(24, 24, 24, 24)
+        left_layout.setSpacing(24)
+        self.importer_title_label = QLabel("Importer Workspace")
+        self.importer_title_label.setObjectName("SectionTitle")
         self.import_search_input = QLineEdit()
-        self.import_search_input.setPlaceholderText("Search tags or paste Google/myinstants link")
+        self.import_search_input.setPlaceholderText("Search myinstants sounds")
+        self.import_search_input.setClearButtonEnabled(True)
         self.import_search_btn = QPushButton("Search")
         self.import_search_btn.setProperty("variant", "primary")
-        self.import_url_btn = QPushButton("Import Link")
-        self.import_url_btn.setProperty("variant", "success")
         self.close_importer_btn = QPushButton("X")
         self.close_importer_btn.setObjectName("ImporterClose")
         self.close_importer_btn.setToolTip("Close importer")
@@ -985,46 +1085,86 @@ class SoundboardWindow(QMainWindow):
         self.preview_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.preview_volume_slider.setRange(0, 100)
         self.preview_volume_slider.setValue(8)
+        self.mic_volume_label = QLabel("Mic Volume: 50%")
+        self.mic_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.mic_volume_slider.setRange(0, 100)
+        self.mic_volume_slider.setValue(50)
         self.remote_feed_list = SmoothListWidget(slow_factor=0.5)
-        self.remote_feed_list.setSpacing(14)
+        self.remote_feed_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.remote_feed_list.setSpacing(16)
+        self.remote_feed_list.setMinimumHeight(120)
 
-        left_layout.addWidget(QLabel("Import Search"), 0, 0)
-        left_layout.addWidget(self.import_search_input, 0, 1, 1, 2)
-        left_layout.addWidget(self.import_search_btn, 0, 3)
-        left_layout.addWidget(self.import_url_btn, 0, 4)
-        left_layout.addWidget(self.close_importer_btn, 0, 5)
-        left_layout.addWidget(self.import_file_btn, 1, 4)
-        left_layout.addWidget(self.fetch_btn, 1, 3)
-        left_layout.addWidget(self.preview_volume_label, 2, 0, 1, 2)
-        left_layout.addWidget(self.preview_volume_slider, 2, 2, 1, 4)
+        importer_header_row = QHBoxLayout()
+        importer_header_row.setContentsMargins(0, 0, 0, 0)
+        importer_header_row.setSpacing(16)
+        importer_header_row.addWidget(self.importer_title_label)
+        importer_header_row.addStretch(1)
+        importer_header_row.addWidget(self.close_importer_btn)
+
+        importer_search_row = QHBoxLayout()
+        importer_search_row.setContentsMargins(0, 0, 0, 0)
+        importer_search_row.setSpacing(12)
+        importer_search_row.addWidget(self.import_search_input, 1)
+        importer_search_row.addWidget(self.import_search_btn)
+
+        importer_actions_row = QHBoxLayout()
+        importer_actions_row.setContentsMargins(0, 0, 0, 0)
+        importer_actions_row.setSpacing(16)
+        importer_actions_row.addWidget(self.import_file_btn)
+        importer_actions_row.addWidget(self.fetch_btn)
+        importer_actions_row.setStretch(0, 1)
+        importer_actions_row.setStretch(1, 1)
+
+        importer_preview_row = QHBoxLayout()
+        importer_preview_row.setContentsMargins(0, 0, 0, 0)
+        importer_preview_row.setSpacing(16)
+        importer_preview_row.addWidget(self.preview_volume_label)
+        importer_preview_row.addWidget(self.preview_volume_slider, 1)
+
+        importer_mic_row = QHBoxLayout()
+        importer_mic_row.setContentsMargins(0, 0, 0, 0)
+        importer_mic_row.setSpacing(16)
+        importer_mic_row.addWidget(self.mic_volume_label)
+        importer_mic_row.addWidget(self.mic_volume_slider, 1)
+
+        left_layout.addLayout(importer_header_row)
+        left_layout.addLayout(importer_search_row)
+        left_layout.addLayout(importer_actions_row)
+        left_layout.addLayout(importer_preview_row)
+        left_layout.addLayout(importer_mic_row)
         importer_hint = QLabel("Click Play or Import on any sound. More loads as you scroll.")
         importer_hint.setObjectName("HintLabel")
-        left_layout.addWidget(importer_hint, 3, 0, 1, 6)
-        left_layout.addWidget(self.remote_feed_list, 4, 0, 1, 6)
+        left_layout.addWidget(importer_hint)
+        left_layout.addItem(QSpacerItem(0, 8, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed))
+        left_layout.addWidget(self.remote_feed_list, 1)
+        self.importer_scroll.setWidget(self.importer_content)
+        left_outer_layout.addWidget(self.importer_scroll)
 
         self.right_group = QGroupBox("Your Soundboard")
         self.right_group.setObjectName("MainCard")
-        right_layout = QHBoxLayout(self.right_group)
-        right_layout.setContentsMargins(14, 18, 14, 12)
-        right_layout.setSpacing(12)
+        self.right_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        right_layout = QVBoxLayout(self.right_group)
+        right_layout.setContentsMargins(16, 16, 16, 16)
+        right_layout.setSpacing(16)
         self.soundboard_sidebar = QWidget()
         self.soundboard_sidebar.setObjectName("SideCard")
-        sidebar_w = 268
+        sidebar_w = 240
         self.soundboard_sidebar.setMinimumWidth(sidebar_w)
         self.soundboard_sidebar.setMaximumWidth(sidebar_w)
         sidebar_layout = QVBoxLayout(self.soundboard_sidebar)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar_layout.setSpacing(10)
+        sidebar_layout.setContentsMargins(20, 20, 20, 20)
+        sidebar_layout.setSpacing(16)
 
         self.soundboard_main = QWidget()
         self.soundboard_main.setObjectName("SoundboardMain")
+        self.soundboard_main.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         main_layout = QVBoxLayout(self.soundboard_main)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(8)
+        main_layout.setSpacing(16)
         self.soundboard_volume_label = QLabel("Soundboard Volume: 100%")
         self.soundboard_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.soundboard_volume_slider.setRange(0, 200)
-        self.soundboard_volume_slider.setValue(70)
+        self.soundboard_volume_slider.setValue(100)
         self.speaker_monitor_btn = QPushButton("Play To Speaker: Off")
         self.speaker_monitor_btn.setProperty("variant", "primary")
         self.speaker_monitor_btn.setCheckable(True)
@@ -1036,6 +1176,21 @@ class SoundboardWindow(QMainWindow):
         self.speaker_monitor_slider.setVisible(False)
         self.toggle_importer_btn = QPushButton("Open Importer")
         self.toggle_importer_btn.setProperty("variant", "violet")
+        self.device_label = QLabel("Audio Route")
+        self.device_label.setObjectName("HintLabel")
+        self.mic_device_label = QLabel("Mic Input")
+        self.mic_device_combo = QComboBox()
+        self.mic_device_combo.setObjectName("RouteCombo")
+        self.output_device_label = QLabel("Mix Output")
+        self.output_device_combo = QComboBox()
+        self.output_device_combo.setObjectName("RouteCombo")
+        self.refresh_devices_btn = QPushButton("Refresh Devices")
+        self.refresh_devices_btn.setProperty("variant", "slate")
+        self.apply_devices_btn = QPushButton("Apply Route")
+        self.apply_devices_btn.setProperty("variant", "primary")
+        self.mic_noise_suppression_btn = QPushButton("Mic Noise Suppression: Off")
+        self.mic_noise_suppression_btn.setProperty("variant", "secondary")
+        self.mic_noise_suppression_btn.setCheckable(True)
         self.play_local_btn = QPushButton("Play Selected")
         self.play_local_btn.setProperty("variant", "success")
         self.trim_local_btn = QPushButton("Trim")
@@ -1054,6 +1209,7 @@ class SoundboardWindow(QMainWindow):
         self.local_search_input.setPlaceholderText("Search imported sounds")
         self.local_list = SmoothListWidget(slow_factor=0.6)
         self.local_list.setObjectName("LocalSoundGrid")
+        self.local_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.local_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.local_list.setViewMode(QListView.ViewMode.IconMode)
         self.local_list.setFlow(QListView.Flow.LeftToRight)
@@ -1061,7 +1217,7 @@ class SoundboardWindow(QMainWindow):
         self.local_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.local_list.setMovement(QListView.Movement.Static)
         self.local_list.setUniformItemSizes(True)
-        self.local_list.setSpacing(20)
+        self.local_list.setSpacing(24)
         self.local_list.setWordWrap(True)
         self.local_list.setSelectionRectVisible(False)
         self.local_list.setMouseTracking(True)
@@ -1088,56 +1244,140 @@ class SoundboardWindow(QMainWindow):
         self._delete_hint_anim.setDuration(250)
         self._delete_hint_anim.setStartValue(0.0)
         self._delete_hint_anim.setEndValue(1.0)
+
+        route_section_layout = QVBoxLayout()
+        route_section_layout.setContentsMargins(0, 0, 0, 0)
+        route_section_layout.setSpacing(16)
+        route_section_layout.addWidget(self.device_label)
+
+        mic_route_layout = QVBoxLayout()
+        mic_route_layout.setContentsMargins(0, 0, 0, 0)
+        mic_route_layout.setSpacing(8)
+        mic_route_layout.addWidget(self.mic_device_label)
+        mic_route_layout.addWidget(self.mic_device_combo)
+        route_section_layout.addLayout(mic_route_layout)
+
+        output_route_layout = QVBoxLayout()
+        output_route_layout.setContentsMargins(0, 0, 0, 0)
+        output_route_layout.setSpacing(8)
+        output_route_layout.addWidget(self.output_device_label)
+        output_route_layout.addWidget(self.output_device_combo)
+        route_section_layout.addLayout(output_route_layout)
+
+        route_actions_layout = QVBoxLayout()
+        route_actions_layout.setContentsMargins(0, 0, 0, 0)
+        route_actions_layout.setSpacing(16)
+        route_actions_layout.addWidget(self.refresh_devices_btn)
+        route_actions_layout.addWidget(self.apply_devices_btn)
+        route_actions_layout.addWidget(self.mic_noise_suppression_btn)
+        route_section_layout.addLayout(route_actions_layout)
+
+        volume_section_layout = QVBoxLayout()
+        volume_section_layout.setContentsMargins(0, 0, 0, 0)
+        volume_section_layout.setSpacing(8)
+        volume_section_layout.addWidget(self.soundboard_volume_label)
+        volume_section_layout.addWidget(self.soundboard_volume_slider)
+
+        speaker_section_layout = QVBoxLayout()
+        speaker_section_layout.setContentsMargins(0, 0, 0, 0)
+        speaker_section_layout.setSpacing(16)
+        speaker_section_layout.addWidget(self.speaker_monitor_btn)
+
+        speaker_volume_layout = QVBoxLayout()
+        speaker_volume_layout.setContentsMargins(0, 0, 0, 0)
+        speaker_volume_layout.setSpacing(8)
+        speaker_volume_layout.addWidget(self.speaker_monitor_label)
+        speaker_volume_layout.addWidget(self.speaker_monitor_slider)
+        speaker_section_layout.addLayout(speaker_volume_layout)
+
+        actions_section_layout = QVBoxLayout()
+        actions_section_layout.setContentsMargins(0, 0, 0, 0)
+        actions_section_layout.setSpacing(16)
+        actions_section_layout.addWidget(self.play_local_btn)
+        actions_section_layout.addWidget(self.trim_local_btn)
+        actions_section_layout.addWidget(self.cancel_trim_btn)
+        actions_section_layout.addWidget(self.delete_local_btn)
+        actions_section_layout.addWidget(self.cancel_delete_btn)
+        actions_section_layout.addWidget(self.refresh_local_btn)
+
+        hint_section_layout = QVBoxLayout()
+        hint_section_layout.setContentsMargins(0, 0, 0, 0)
+        hint_section_layout.setSpacing(8)
+        hint_section_layout.addWidget(self.delete_mode_hint)
+        hint_section_layout.addWidget(self.trim_mode_hint)
+
         sidebar_layout.addWidget(self.toggle_importer_btn)
-        sidebar_layout.addWidget(self.soundboard_volume_label)
-        sidebar_layout.addWidget(self.soundboard_volume_slider)
-        sidebar_layout.addWidget(self.speaker_monitor_btn)
-        sidebar_layout.addWidget(self.speaker_monitor_label)
-        sidebar_layout.addWidget(self.speaker_monitor_slider)
-        sidebar_layout.addWidget(self.play_local_btn)
-        sidebar_layout.addWidget(self.trim_local_btn)
-        sidebar_layout.addWidget(self.cancel_trim_btn)
-        sidebar_layout.addWidget(self.delete_local_btn)
-        sidebar_layout.addWidget(self.cancel_delete_btn)
-        sidebar_layout.addWidget(self.refresh_local_btn)
-        sidebar_layout.addWidget(self.delete_mode_hint)
-        sidebar_layout.addWidget(self.trim_mode_hint)
+        sidebar_layout.addItem(QSpacerItem(0, 24, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed))
+        sidebar_layout.addLayout(route_section_layout)
+        sidebar_layout.addItem(QSpacerItem(0, 24, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed))
+        sidebar_layout.addLayout(volume_section_layout)
+        sidebar_layout.addItem(QSpacerItem(0, 24, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed))
+        sidebar_layout.addLayout(speaker_section_layout)
+        sidebar_layout.addItem(QSpacerItem(0, 24, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed))
+        sidebar_layout.addLayout(actions_section_layout)
+        sidebar_layout.addItem(QSpacerItem(0, 24, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed))
+        sidebar_layout.addLayout(hint_section_layout)
         sidebar_layout.addStretch(1)
 
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setObjectName("SideScroll")
+        self.sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.sidebar_scroll.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.sidebar_scroll.setMinimumWidth(sidebar_w + 10)
+        self.sidebar_scroll.setMaximumWidth(sidebar_w + 10)
+        self.sidebar_scroll.setWidget(self.soundboard_sidebar)
+
         local_header = QHBoxLayout()
-        local_header.setSpacing(10)
+        local_header.setSpacing(16)
         local_header.addWidget(self.local_title)
         local_header.addStretch(1)
         local_header.addWidget(self.local_search_input, 0)
         main_layout.addLayout(local_header)
         main_layout.addWidget(self.local_list, 1)
 
-        right_layout.addWidget(self.soundboard_sidebar)
         right_layout.addWidget(self.soundboard_main, 1)
+        main_column_layout.addWidget(self.right_group, 1)
+        root_layout.addWidget(self.sidebar_scroll)
+        root_layout.addWidget(self.main_content, 1)
 
-        top_row = QHBoxLayout()
-        top_row.setSpacing(14)
-        top_row.addWidget(self.right_group, 1618)
-        top_row.addWidget(self.left_group, 1000)
-        grid.addLayout(top_row, 1, 0)
-        self._importer_fx = QGraphicsOpacityEffect(self.left_group)
-        self.left_group.setGraphicsEffect(self._importer_fx)
-        self._importer_fx.setOpacity(1.0)
-        self._importer_anim = QPropertyAnimation(self._importer_fx, b"opacity", self)
-        self._importer_anim.setDuration(190)
-        self._importer_anim.setStartValue(0.0)
-        self._importer_anim.setEndValue(1.0)
-        self._importer_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.importer_window = FramelessImporterDialog(self)
+        self.importer_window.setObjectName("ImporterWindow")
+        self.importer_window.setWindowTitle("Importer - SoundboardEZ")
+        self.importer_window.setModal(False)
+        self.importer_window.setMinimumSize(680, 520)
+        self.importer_window.resize(760, 620)
+        self.importer_shell = QWidget()
+        self.importer_shell.setObjectName("ImporterShell")
+        importer_shadow = QGraphicsDropShadowEffect(self.importer_shell)
+        importer_shadow.setBlurRadius(38)
+        importer_shadow.setOffset(0, 14)
+        importer_shadow.setColor(QColor(4, 11, 24, 180))
+        self.importer_shell.setGraphicsEffect(importer_shadow)
+        importer_shell_layout = QVBoxLayout(self.importer_shell)
+        importer_shell_layout.setContentsMargins(20, 20, 20, 20)
+        importer_shell_layout.setSpacing(0)
+        importer_shell_layout.addWidget(self.left_group)
+        importer_window_layout = QVBoxLayout(self.importer_window)
+        importer_window_layout.setContentsMargins(8, 8, 8, 8)
+        importer_window_layout.setSpacing(0)
+        importer_window_layout.addWidget(self.importer_shell)
+        self.importer_window.finished.connect(lambda _=0: self._set_importer_visible(False))
 
         self.import_search_btn.clicked.connect(self.apply_import_search)
-        self.import_url_btn.clicked.connect(self.import_from_link)
         self.close_importer_btn.clicked.connect(self.close_importer_panel)
         self.import_search_input.returnPressed.connect(self.apply_import_search)
         self.fetch_btn.clicked.connect(self.fetch_sounds)
         self.preview_volume_slider.valueChanged.connect(self.update_preview_volume_label)
+        self.mic_volume_slider.valueChanged.connect(self.update_mic_volume_label)
         self.soundboard_volume_slider.valueChanged.connect(self.update_soundboard_volume)
         self.speaker_monitor_btn.toggled.connect(self.toggle_speaker_monitor)
+        self.mic_noise_suppression_btn.toggled.connect(self.toggle_mic_noise_suppression)
         self.speaker_monitor_slider.valueChanged.connect(self.update_speaker_monitor_volume_label)
+        self.refresh_devices_btn.clicked.connect(self.refresh_audio_devices)
+        self.apply_devices_btn.clicked.connect(self.apply_audio_route)
         self.toggle_importer_btn.clicked.connect(self.toggle_importer_panel)
         self.play_local_btn.clicked.connect(self.play_selected_imported)
         self.trim_local_btn.clicked.connect(self.trim_selected_imported)
@@ -1163,27 +1403,108 @@ class SoundboardWindow(QMainWindow):
         self._apply_button_motion()
         self._importer_loaded_once = False
         self._set_importer_visible(False)
+        self.refresh_audio_devices()
         self.refresh_local()
         self.update_preview_volume_label(self.preview_volume_slider.value())
+        self.update_mic_volume_label(self.mic_volume_slider.value())
         self.update_soundboard_volume(self.soundboard_volume_slider.value())
         self.update_speaker_monitor_volume_label(self.speaker_monitor_slider.value())
+        self.engine.set_noise_suppression_enabled(False)
+        self._sync_mic_noise_suppression_button()
+        self._update_route_status()
         self._run_entrance_animation()
 
     def _run_engine(self) -> None:
         try:
-            mapping = self.engine.setup_soundboard(auto_hotkeys=True)
-            if mapping:
-                print("Initial hotkeys:")
-                for key, name in mapping.items():
-                    print(f"  {key} -> {name}")
+            if not self._soundboard_initialized:
+                mapping = self.engine.setup_soundboard(auto_hotkeys=True)
+                self._soundboard_initialized = True
+                if mapping:
+                    print("Initial hotkeys:")
+                    for key, name in mapping.items():
+                        print(f"  {key} -> {name}")
             self.engine.start()
         except Exception as exc:
             print(f"Audio engine error: {exc}")
+
+    @staticmethod
+    def _coerce_device_data(value) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        text = str(value).strip()
+        if not text:
+            return None
+        if text == "AUTO":
+            return None
+        try:
+            return int(text)
+        except Exception:
+            return None
+
+    def _update_route_status(self) -> None:
+        in_name, out_name = self.engine.get_route_summary()
+        self.route_status_label.setText(f"Hosted On: {out_name} | Mic: {in_name}")
+
+    def refresh_audio_devices(self) -> None:
+        current_in = self._coerce_device_data(self.mic_device_combo.currentData())
+        current_out = self._coerce_device_data(self.output_device_combo.currentData())
+
+        self.mic_device_combo.clear()
+        self.output_device_combo.clear()
+        self.mic_device_combo.addItem("System Default", "AUTO")
+        self.output_device_combo.addItem("Auto (VB-Cable)", "AUTO")
+
+        try:
+            for idx, label in self.engine.list_input_devices():
+                self.mic_device_combo.addItem(label, idx)
+            for idx, label in self.engine.list_output_devices():
+                self.output_device_combo.addItem(label, idx)
+        except Exception as exc:
+            self.status_label.setText(f"Device query failed: {exc}")
+            return
+
+        target_in = self.engine.input_device if self.engine.input_device is not None else current_in
+        target_out = self.engine.output_device if self.engine.output_device is not None else current_out
+        if target_in is not None:
+            idx = self.mic_device_combo.findData(target_in)
+            if idx >= 0:
+                self.mic_device_combo.setCurrentIndex(idx)
+        if target_out is not None:
+            idx = self.output_device_combo.findData(target_out)
+            if idx >= 0:
+                self.output_device_combo.setCurrentIndex(idx)
+
+        self.status_label.setText("Audio devices refreshed.")
+        self._update_route_status()
+
+    def _restart_audio_engine(self) -> None:
+        self.engine.stop()
+        if self._engine_thread.is_alive():
+            self._engine_thread.join(timeout=2.5)
+        self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
+        self._engine_thread.start()
+
+    def apply_audio_route(self) -> None:
+        in_dev = self._coerce_device_data(self.mic_device_combo.currentData())
+        out_dev = self._coerce_device_data(self.output_device_combo.currentData())
+        self.engine.input_device = in_dev
+        self.engine.output_device = out_dev
+        try:
+            self._restart_audio_engine()
+            self.status_label.setText("Audio route applied.")
+            self._update_route_status()
+        except Exception as exc:
+            self.status_label.setText(f"Failed to apply route: {exc}")
 
     def _apply_button_ratios(self) -> None:
         sidebar_buttons = [
             self.toggle_importer_btn,
             self.speaker_monitor_btn,
+            self.mic_noise_suppression_btn,
+            self.refresh_devices_btn,
+            self.apply_devices_btn,
             self.play_local_btn,
             self.trim_local_btn,
             self.cancel_trim_btn,
@@ -1192,46 +1513,62 @@ class SoundboardWindow(QMainWindow):
             self.refresh_local_btn,
         ]
         for btn in sidebar_buttons:
-            btn.setMinimumHeight(38)
-            btn.setMaximumHeight(40)
-            btn.setMinimumWidth(220)
+            btn.setMinimumHeight(34)
+            btn.setMaximumHeight(36)
+            btn.setMinimumWidth(0)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         importer_buttons = [
             self.import_search_btn,
-            self.import_url_btn,
             self.fetch_btn,
             self.import_file_btn,
         ]
         for btn in importer_buttons:
-            btn.setMinimumHeight(34)
-            btn.setMaximumHeight(36)
-            btn.setMinimumWidth(96)
-            btn.setMaximumWidth(130)
+            btn.setMinimumHeight(40)
+            btn.setMaximumHeight(44)
+            btn.setMinimumWidth(0)
+            btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
-        self.close_importer_btn.setMinimumSize(30, 30)
-        self.close_importer_btn.setMaximumSize(30, 30)
-        self.local_search_input.setMinimumWidth(260)
-        self.import_search_input.setMinimumHeight(36)
+        self.close_importer_btn.setMinimumSize(32, 32)
+        self.close_importer_btn.setMaximumSize(32, 32)
+        self.local_search_input.setMinimumWidth(220)
+        self.import_search_input.setMinimumHeight(46)
+        self.preview_volume_slider.setMinimumWidth(220)
+        self.mic_volume_slider.setMinimumWidth(220)
+        self.mic_device_combo.setMinimumHeight(32)
+        self.mic_device_combo.setMinimumWidth(0)
+        self.mic_device_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.output_device_combo.setMinimumHeight(32)
+        self.output_device_combo.setMinimumWidth(0)
+        self.output_device_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def _apply_modern_theme(self) -> None:
         self.setStyleSheet(
             """
             QWidget#Root {
-                background: qradialgradient(cx:0.16, cy:0.08, radius:1.28,
-                    fx:0.08, fy:0.05,
-                    stop:0 rgba(48, 89, 255, 0.42),
-                    stop:0.34 rgba(13, 23, 56, 0.98),
-                    stop:1 rgba(4, 8, 24, 1.0));
-                color: #edf4ff;
-                font-family: "SF Pro Display", "Segoe UI Variable Text", "Segoe UI", sans-serif;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #0a111d,
+                    stop:1 #0f1b2f);
+                color: #e7edf7;
+                font-family: "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", sans-serif;
                 font-size: 13px;
             }
+            QWidget#MainContent {
+                background: transparent;
+            }
+            QDialog#ImporterWindow {
+                background: transparent;
+                border: none;
+            }
+            QWidget#ImporterShell {
+                background: rgba(16, 25, 39, 238);
+                border: 1px solid rgba(148, 163, 184, 38);
+                border-radius: 28px;
+            }
             QFrame#TopBar {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 rgba(255, 255, 255, 0.12),
-                    stop:1 rgba(255, 255, 255, 0.05));
-                border: 1px solid rgba(180, 207, 255, 0.22);
-                border-radius: 18px;
+                background: rgba(37, 53, 74, 210);
+                border: 1px solid rgba(148, 163, 184, 36);
+                border-radius: 20px;
             }
             QLabel#LogoBadge {
                 min-width: 32px;
@@ -1239,237 +1576,252 @@ class SoundboardWindow(QMainWindow):
                 min-height: 32px;
                 max-height: 32px;
                 border-radius: 16px;
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 rgba(94, 234, 212, 0.95),
-                    stop:1 rgba(99, 102, 241, 0.95));
-                color: #061123;
+                background: rgba(12, 20, 34, 188);
+                border: 1px solid #7dd3fc;
+                color: #e7edf7;
                 font-size: 12px;
-                font-weight: 800;
+                font-weight: 650;
             }
             QLabel#AppTitle {
-                color: #f8fbff;
-                font-size: 17px;
-                font-weight: 750;
-                letter-spacing: 0.3px;
+                color: #f1f5fb;
+                font-size: 24px;
+                font-weight: 600;
+                letter-spacing: 0.2px;
             }
             QLabel#AppSubtitle {
-                color: rgba(220, 233, 255, 0.78);
-                font-size: 12px;
+                color: #9eb2cc;
+                font-size: 15px;
                 font-weight: 500;
             }
-            QGroupBox#MainCard,
-            QGroupBox#ImporterCard,
-            QGroupBox#SideCard {
-                background: qlineargradient(x1:0, y1:0, x2:0.9, y2:1,
-                    stop:0 rgba(255, 255, 255, 0.10),
-                    stop:1 rgba(255, 255, 255, 0.04));
-                border: 1px solid rgba(190, 214, 255, 0.24);
-                border-radius: 20px;
-                margin-top: 10px;
-                padding-top: 11px;
+            QGroupBox#MainCard {
+                background: rgba(30, 42, 60, 205);
+                border: 1px solid rgba(148, 163, 184, 32);
+                border-radius: 22px;
+                margin-top: 18px;
+                padding-top: 14px;
             }
-            QGroupBox#MainCard::title,
-            QGroupBox#ImporterCard::title,
-            QGroupBox#SideCard::title {
+            QGroupBox#MainCard::title {
                 subcontrol-origin: margin;
-                left: 16px;
-                padding: 3px 12px;
-                color: #f3f8ff;
-                font-weight: 700;
-                background: rgba(10, 22, 54, 0.92);
-                border: 1px solid rgba(124, 223, 255, 0.42);
+                left: 20px;
+                padding: 2px 12px;
+                color: #d5e1f1;
+                font-size: 14px;
+                font-weight: 600;
+                background: rgba(19, 30, 47, 210);
+                border: none;
                 border-radius: 11px;
             }
+            QGroupBox#ImporterCard {
+                background: transparent;
+                border: none;
+                margin-top: 0px;
+                padding-top: 0px;
+            }
+            QGroupBox#ImporterCard::title {
+                width: 0px;
+                height: 0px;
+                padding: 0px;
+            }
             QWidget#SideCard {
-                background: rgba(9, 21, 56, 0.50);
-                border-radius: 18px;
+                background: rgba(40, 56, 78, 176);
+                border: 1px solid rgba(148, 163, 184, 30);
+                border-radius: 20px;
+            }
+            QScrollArea#SideScroll {
+                background: transparent;
+                border: none;
+            }
+            QScrollArea#ImporterScroll {
+                background: transparent;
+                border: none;
+            }
+            QScrollArea#SideScroll QWidget#qt_scrollarea_viewport {
+                background: transparent;
+                border: none;
+            }
+            QScrollArea#ImporterScroll QWidget#qt_scrollarea_viewport {
+                background: transparent;
+                border: none;
             }
             QWidget#SoundboardMain {
-                background: rgba(7, 16, 43, 0.48);
-                border: 1px solid rgba(167, 196, 255, 0.20);
-                border-radius: 18px;
-                padding: 6px;
+                background: rgba(31, 46, 67, 186);
+                border: 1px solid rgba(148, 163, 184, 30);
+                border-radius: 20px;
+                padding: 10px;
             }
             QLabel#SectionTitle {
-                font-size: 18px;
-                font-weight: 730;
-                color: #f6fbff;
+                font-size: 22px;
+                font-weight: 600;
+                color: #edf3fb;
                 letter-spacing: 0.2px;
             }
             QLabel {
-                color: #dbe7ff;
+                color: #e7edf7;
             }
             QLabel#HintLabel {
-                color: rgba(212, 229, 255, 0.78);
-                font-size: 11px;
+                color: #8fa5c1;
+                font-size: 12px;
             }
             QLabel#FeedNameLabel {
-                color: #edf4ff;
-                font-size: 13px;
-                font-weight: 560;
+                color: #e6eef8;
+                font-size: 14px;
+                font-weight: 500;
+            }
+            QWidget#FeedRow {
+                background: rgba(17, 28, 46, 182);
+                border: 1px solid rgba(148, 163, 184, 26);
+                border-radius: 16px;
             }
             QLabel#StatusPill {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 rgba(12, 31, 80, 0.86),
-                    stop:1 rgba(20, 58, 131, 0.72));
-                color: #f3f8ff;
-                border: 1px solid rgba(128, 229, 255, 0.65);
-                border-radius: 14px;
-                padding: 8px 13px;
-                font-weight: 650;
+                background: rgba(21, 33, 52, 210);
+                color: #d8e4f2;
+                border: 1px solid rgba(148, 163, 184, 34);
+                border-radius: 13px;
+                padding: 7px 14px;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QLabel#RoutePill {
+                background: transparent;
+                color: #9fb3cb;
+                border: none;
+                padding: 0px 2px;
+                font-size: 12px;
+                font-weight: 500;
             }
             QLineEdit {
-                background: rgba(9, 20, 49, 0.62);
-                border: 1px solid rgba(143, 187, 255, 0.35);
-                border-radius: 14px;
-                padding: 8px 12px;
-                selection-background-color: rgba(83, 204, 255, 0.65);
-                color: #eef4ff;
+                background: rgba(8, 18, 33, 235);
+                border: 1px solid rgba(148, 163, 184, 44);
+                border-radius: 15px;
+                padding: 10px 13px;
+                selection-background-color: #45c8ff;
+                color: #e7edf7;
+                font-size: 14px;
             }
             QLineEdit:focus {
-                border: 1px solid rgba(91, 219, 255, 0.92);
-                background: rgba(13, 26, 68, 0.88);
+                border: 1px solid #62d6ff;
+                background: rgba(10, 24, 43, 245);
+            }
+            QComboBox#RouteCombo {
+                background: rgba(9, 19, 34, 235);
+                border: 1px solid rgba(148, 163, 184, 44);
+                border-radius: 15px;
+                padding: 8px 10px;
+                color: #e7edf7;
+                font-size: 14px;
+            }
+            QComboBox#RouteCombo::drop-down {
+                border: none;
+                width: 22px;
+            }
+            QComboBox#RouteCombo QAbstractItemView {
+                background: #0f1b2d;
+                border: 1px solid #3b4d68;
+                border-radius: 12px;
+                color: #e7edf7;
+                selection-background-color: #294768;
             }
             QPushButton {
-                border-radius: 18px;
-                border: 1px solid rgba(194, 220, 255, 0.34);
+                border-radius: 15px;
+                border: 1px solid rgba(148, 163, 184, 52);
                 padding: 6px 14px;
-                min-height: 34px;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(255,255,255,0.23),
-                    stop:1 rgba(255,255,255,0.10));
-                color: #f5f8ff;
-                font-weight: 680;
+                min-height: 30px;
+                background: rgba(62, 79, 104, 220);
+                color: #eaf2fb;
+                font-weight: 600;
+                font-size: 14px;
             }
             QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(255,255,255,0.30),
-                    stop:1 rgba(255,255,255,0.16));
-                border-color: rgba(132, 238, 255, 0.74);
+                background: rgba(76, 97, 126, 230);
+                border-color: rgba(96, 214, 255, 190);
             }
             QPushButton:pressed {
-                padding-top: 8px;
-                padding-bottom: 4px;
-                background: rgba(255, 255, 255, 0.23);
+                background: rgba(56, 74, 98, 235);
             }
-            QPushButton[variant="primary"] {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(86, 197, 255, 0.68),
-                    stop:1 rgba(36, 112, 255, 0.58));
-                border-color: rgba(143, 225, 255, 0.90);
-            }
-            QPushButton[variant="success"] {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(34, 219, 169, 0.68),
-                    stop:1 rgba(11, 163, 124, 0.56));
-                border-color: rgba(119, 255, 216, 0.86);
+            QPushButton:checked,
+            QPushButton[active="true"] {
+                background: #0f6f98;
+                border-color: #62d6ff;
+                color: #f7fbff;
             }
             QPushButton[variant="danger"] {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(255, 106, 146, 0.70),
-                    stop:1 rgba(215, 48, 96, 0.58));
-                border-color: rgba(255, 182, 204, 0.90);
+                background: rgba(111, 43, 57, 222);
+                border-color: rgba(248, 113, 113, 128);
             }
-            QPushButton[variant="violet"] {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(178, 121, 255, 0.72),
-                    stop:1 rgba(118, 74, 224, 0.58));
-                border-color: rgba(216, 188, 255, 0.90);
-            }
-            QPushButton[variant="cyan"] {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(55, 219, 255, 0.72),
-                    stop:1 rgba(10, 149, 202, 0.58));
-                border-color: rgba(150, 242, 255, 0.90);
-            }
-            QPushButton[variant="amber"] {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(253, 211, 75, 0.72),
-                    stop:1 rgba(217, 126, 20, 0.56));
-                border-color: rgba(254, 226, 183, 0.90);
-            }
-            QPushButton[variant="slate"] {
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(129, 145, 171, 0.58),
-                    stop:1 rgba(86, 99, 128, 0.52));
-                border-color: rgba(213, 223, 238, 0.76);
+            QPushButton[variant="danger"]:hover {
+                background: rgba(132, 52, 69, 232);
+                border-color: rgba(252, 165, 165, 188);
             }
             QPushButton#ImporterClose {
-                min-width: 30px;
-                max-width: 30px;
-                min-height: 30px;
-                max-height: 30px;
-                border-radius: 15px;
+                min-width: 28px;
+                max-width: 28px;
+                min-height: 28px;
+                max-height: 28px;
+                border-radius: 14px;
                 padding: 0;
-                background: rgba(255, 94, 126, 0.60);
-                border: 1px solid rgba(255, 170, 192, 0.85);
-                color: #fff1f5;
+                background: rgba(69, 85, 110, 218);
+                border: 1px solid rgba(148, 163, 184, 52);
+                color: #f0f6ff;
                 font-weight: 700;
             }
             QPushButton#ImporterClose:hover {
-                background: rgba(255, 86, 117, 0.82);
+                background: rgba(86, 104, 134, 230);
+                border-color: rgba(96, 214, 255, 196);
             }
             QListWidget {
-                background: rgba(6, 14, 39, 0.60);
-                border: 1px solid rgba(160, 195, 255, 0.26);
+                background: rgba(10, 21, 38, 228);
+                border: 1px solid rgba(148, 163, 184, 36);
                 border-radius: 18px;
-                padding: 8px;
+                padding: 10px;
                 outline: none;
             }
             QListWidget#LocalSoundGrid {
-                background: rgba(5, 12, 34, 0.56);
-                border: 1px solid rgba(152, 188, 255, 0.26);
-                border-radius: 20px;
-                padding: 12px;
+                background: rgba(14, 26, 45, 226);
+                border: 1px solid rgba(148, 163, 184, 36);
+                border-radius: 18px;
+                padding: 10px;
             }
             QListWidget#LocalSoundGrid::item {
-                border: 1px solid rgba(196, 214, 255, 0.30);
-                border-radius: 16px;
-                padding: 8px 10px;
-                margin: 4px;
-                color: #f8fbff;
-                font-weight: 700;
+                border: none;
+                color: #edf4fc;
             }
             QListWidget#LocalSoundGrid::item:selected {
-                border: 1px solid rgba(255, 255, 255, 0.86);
                 background: transparent;
-                color: #ffffff;
+                color: #edf4fc;
             }
             QListWidget::item {
-                border-radius: 10px;
+                border-radius: 12px;
                 padding: 6px;
                 margin: 2px;
             }
             QListWidget::item:selected {
-                background: rgba(66, 138, 255, 0.34);
-                color: #ffffff;
+                background: rgba(33, 52, 75, 210);
+                color: #edf4fc;
             }
             QSlider::groove:horizontal {
-                border-radius: 7px;
-                height: 10px;
-                background: rgba(120, 150, 218, 0.30);
+                border-radius: 6px;
+                height: 8px;
+                background: rgba(26, 42, 62, 220);
             }
             QSlider::sub-page:horizontal {
-                border-radius: 7px;
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 rgba(78, 233, 255, 0.96),
-                    stop:1 rgba(96, 128, 255, 0.96));
+                border-radius: 6px;
+                background: #45c8ff;
             }
             QSlider::handle:horizontal {
-                background: #f8fbff;
-                border: 1px solid rgba(158, 198, 255, 0.95);
-                width: 19px;
-                margin: -6px 0;
-                border-radius: 9px;
+                background: #dbe7f6;
+                border: 1px solid #6b7f9b;
+                width: 16px;
+                margin: -5px 0;
+                border-radius: 8px;
             }
             QScrollBar:vertical {
                 background: transparent;
-                width: 10px;
+                width: 11px;
                 margin: 3px;
             }
             QScrollBar::handle:vertical {
-                background: rgba(132, 171, 247, 0.62);
-                border: 1px solid rgba(185, 218, 255, 0.62);
+                background: rgba(85, 104, 132, 220);
+                border: 1px solid rgba(148, 163, 184, 76);
                 border-radius: 5px;
                 min-height: 34px;
             }
@@ -1480,45 +1832,14 @@ class SoundboardWindow(QMainWindow):
         )
 
     def _apply_button_motion(self) -> None:
-        buttons = [
-            self.toggle_importer_btn,
-            self.speaker_monitor_btn,
-            self.play_local_btn,
-            self.trim_local_btn,
-            self.cancel_trim_btn,
-            self.delete_local_btn,
-            self.cancel_delete_btn,
-            self.refresh_local_btn,
-            self.import_search_btn,
-            self.import_url_btn,
-            self.fetch_btn,
-            self.import_file_btn,
-            self.close_importer_btn,
-            self.trim_play_pause_btn,
-            self.trim_stop_btn,
-            self.apply_trim_btn,
-            self.close_trim_editor_btn,
-        ]
-        for btn in buttons:
-            variant = str(btn.property("variant") or "")
-            if variant == "danger":
-                glow = "#fb7185"
-            elif variant == "success":
-                glow = "#34d399"
-            elif variant == "violet":
-                glow = "#a78bfa"
-            elif variant == "cyan":
-                glow = "#22d3ee"
-            else:
-                glow = "#67e8f9"
-            self._button_motion.attach(btn, glow=glow)
+        # Keep interaction light-weight in the minimal theme.
+        return
 
     def _run_entrance_animation(self) -> None:
         sequence = [
             (self.top_bar, 0),
-            (self.soundboard_sidebar, 70),
+            (self.sidebar_scroll, 70),
             (self.right_group, 120),
-            (self.left_group, 180),
         ]
         for widget, start_ms in sequence:
             if not widget.isVisible():
@@ -1555,21 +1876,30 @@ class SoundboardWindow(QMainWindow):
         self._workers.append(worker)
         thread.start()
 
+    def _position_importer_window(self) -> None:
+        frame = self.frameGeometry()
+        if frame.isNull():
+            return
+        x = frame.x() + max(24, int(frame.width() * 0.12))
+        y = frame.y() + max(20, int(frame.height() * 0.08))
+        self.importer_window.move(x, y)
+
     def _set_importer_visible(self, visible: bool) -> None:
         if visible:
-            self.left_group.setVisible(True)
-            self._importer_anim.stop()
-            self._importer_fx.setOpacity(0.0)
-            self._importer_anim.start()
+            if not self.importer_window.isVisible():
+                self._position_importer_window()
+            self.importer_window.show()
+            self.importer_window.raise_()
+            self.importer_window.activateWindow()
         else:
-            self.left_group.setVisible(False)
+            self.importer_window.hide()
         self.toggle_importer_btn.setText("Close Importer" if visible else "Open Importer")
         if visible and not self._importer_loaded_once:
             self.fetch_sounds()
             self._importer_loaded_once = True
 
     def toggle_importer_panel(self) -> None:
-        self._set_importer_visible(not self.left_group.isVisible())
+        self._set_importer_visible(not self.importer_window.isVisible())
 
     def close_importer_panel(self) -> None:
         self._set_importer_visible(False)
@@ -1706,10 +2036,31 @@ class SoundboardWindow(QMainWindow):
             self._feed_loading = False
             self._fetch_timeout.stop()
             self.fetch_btn.setEnabled(True)
-            self.status_label.setText("Feed load failed.")
-            QMessageBox.critical(self, "Fetch Error", message)
+            friendly = self._friendly_fetch_error(message)
+            self.status_label.setText(friendly)
+            print(f"Feed load error: {message}")
 
         self._run_worker(worker, done, err)
+
+    @staticmethod
+    def _friendly_fetch_error(message: str) -> str:
+        text = str(message or "").strip()
+        lower = text.lower()
+        if not text:
+            return "Feed load failed. Please try again."
+        if "connectionreseterror" in lower or "forcibly closed by the remote host" in lower:
+            return "Connection was reset by myinstants. Try Reload Feed in a moment."
+        if "timed out" in lower or "readtimeout" in lower or "connecttimeout" in lower:
+            return "Feed request timed out. Check connection and retry."
+        if "name or service not known" in lower or "failed to establish a new connection" in lower:
+            return "Cannot reach myinstants right now. Check internet/VPN and retry."
+        if "403" in lower or "forbidden" in lower:
+            return "myinstants rejected this request. Try again shortly."
+        if "404" in lower:
+            return "Feed URL not found. Check the search URL."
+        if "unable to load myinstants feed:" in lower:
+            return text.split(":", 1)[0].strip() + ". Please retry."
+        return "Feed load failed. Please retry."
 
     def _on_feed_scroll(self, value: int) -> None:
         bar = self.remote_feed_list.verticalScrollBar()
@@ -1721,21 +2072,23 @@ class SoundboardWindow(QMainWindow):
     def _add_feed_row(self, item: RemoteSoundItem) -> None:
         row_item = QListWidgetItem()
         row_widget = QWidget()
+        row_widget.setObjectName("FeedRow")
         row_layout = QHBoxLayout(row_widget)
-        row_layout.setContentsMargins(10, 6, 10, 6)
+        row_layout.setContentsMargins(10, 10, 10, 10)
         row_layout.setSpacing(10)
-        row_widget.setMinimumHeight(46)
+        row_widget.setMinimumHeight(56)
 
         name_lbl = QLabel(item.name)
         name_lbl.setObjectName("FeedNameLabel")
         name_lbl.setToolTip(item.url)
         play_btn = QPushButton("Play")
-        row_btn_h = 30
-        play_btn_w = 84
-        import_btn_w = 112
-        play_btn.setFixedSize(play_btn_w, row_btn_h)
+        play_btn.setMinimumHeight(32)
+        play_btn.setMinimumWidth(78)
+        play_btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         import_btn = QPushButton("Import")
-        import_btn.setFixedSize(import_btn_w, row_btn_h)
+        import_btn.setMinimumHeight(32)
+        import_btn.setMinimumWidth(102)
+        import_btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self._style_feed_buttons(play_btn, import_btn, seed=item.url)
         play_btn.clicked.connect(lambda _=False, it=item: self.toggle_remote_play(it))
         import_btn.clicked.connect(lambda _=False, it=item: self.import_remote_item(it))
@@ -1745,73 +2098,47 @@ class SoundboardWindow(QMainWindow):
         row_layout.addWidget(play_btn)
         row_layout.addWidget(import_btn)
 
-        row_item.setSizeHint(QSize(0, 58))
+        row_item.setSizeHint(QSize(0, 66))
         row_widget.mouseDoubleClickEvent = lambda _event, it=item: self.toggle_remote_play(it)  # type: ignore[attr-defined]
         self.remote_feed_list.addItem(row_item)
         self.remote_feed_list.setItemWidget(row_item, row_widget)
 
     def _style_feed_buttons(self, play_btn: QPushButton, import_btn: QPushButton, seed: str) -> None:
-        play_palette = [
-            ("#60a5fa", "#2563eb"),
-            ("#22d3ee", "#0891b2"),
-            ("#a78bfa", "#7c3aed"),
-            ("#f472b6", "#db2777"),
-            ("#f59e0b", "#d97706"),
-        ]
-        import_palette = [
-            ("#34d399", "#059669"),
-            ("#22c55e", "#15803d"),
-            ("#2dd4bf", "#0f766e"),
-            ("#f97316", "#ea580c"),
-            ("#fb7185", "#e11d48"),
-        ]
-        rng = random.Random(seed)
-        pc1, pc2 = play_palette[rng.randrange(len(play_palette))]
-        ic1, ic2 = import_palette[rng.randrange(len(import_palette))]
-
-        play_btn.setStyleSheet(
-            f"""
-            QPushButton {{
-                border-radius: 15px;
-                border: 1px solid rgba(220,235,255,0.80);
-                font-size: 12px;
-                font-weight: 700;
+        _ = seed
+        feed_button_style = """
+            QPushButton {
+                border-radius: 12px;
+                border: 1px solid rgba(148, 163, 184, 52);
+                font-size: 13px;
+                font-weight: 600;
                 min-height: 0px;
-                max-height: 30px;
+                max-height: 32px;
                 padding: 0px 10px;
-                color: #f8fbff;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {pc1}, stop:1 {pc2});
-            }}
-            QPushButton:hover {{
-                border-color: rgba(255,255,255,0.98);
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255,255,255,0.36), stop:1 {pc2});
-            }}
-            QPushButton:pressed {{ padding-top: 2px; background: rgba(255,255,255,0.22); }}
-            QPushButton:disabled {{ background: rgba(107,114,128,0.55); color: rgba(255,255,255,0.8); }}
+                color: #eaf2fb;
+                background: rgba(64, 82, 108, 220);
+            }
+            QPushButton:hover {
+                background: rgba(81, 101, 130, 230);
+                border-color: rgba(96, 214, 255, 188);
+            }
+            QPushButton:pressed {
+                background: rgba(58, 77, 102, 235);
+            }
+            QPushButton[active="true"] {
+                background: #0f6f98;
+                border-color: #62d6ff;
+                color: #f7fbff;
+            }
+            QPushButton:disabled {
+                background: rgba(27, 39, 58, 220);
+                border-color: rgba(71, 85, 105, 120);
+                color: #8fa5c1;
+            }
             """
-        )
-        import_btn.setStyleSheet(
-            f"""
-            QPushButton {{
-                border-radius: 15px;
-                border: 1px solid rgba(220,255,240,0.86);
-                font-size: 12px;
-                font-weight: 700;
-                min-height: 0px;
-                max-height: 30px;
-                padding: 0px 10px;
-                color: #f8fbff;
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {ic1}, stop:1 {ic2});
-            }}
-            QPushButton:hover {{
-                border-color: rgba(255,255,255,0.98);
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255,255,255,0.34), stop:1 {ic2});
-            }}
-            QPushButton:pressed {{ padding-top: 2px; background: rgba(255,255,255,0.22); }}
-            """
-        )
-        self._button_motion.attach(play_btn, glow=pc1)
-        self._button_motion.attach(import_btn, glow=ic1)
+        play_btn.setProperty("active", False)
+        import_btn.setProperty("active", False)
+        play_btn.setStyleSheet(feed_button_style)
+        import_btn.setStyleSheet(feed_button_style)
 
     def toggle_remote_play(self, item: RemoteSoundItem) -> None:
         if self._current_preview_url == item.url:
@@ -1874,11 +2201,24 @@ class SoundboardWindow(QMainWindow):
         if btn is not None:
             btn.setText(text)
             btn.setEnabled(enabled)
+            btn.setProperty("active", text.strip().lower() == "stop")
+            self._refresh_dynamic_button_style(btn)
 
     def _reset_feed_play_buttons(self) -> None:
         for btn in self._feed_play_buttons.values():
             btn.setText("Play")
             btn.setEnabled(True)
+            btn.setProperty("active", False)
+            self._refresh_dynamic_button_style(btn)
+
+    @staticmethod
+    def _refresh_dynamic_button_style(button: QPushButton) -> None:
+        style = button.style()
+        if style is None:
+            return
+        style.unpolish(button)
+        style.polish(button)
+        button.update()
 
     def _check_preview_finished(self) -> None:
         if self._current_preview_url is None:
@@ -1963,8 +2303,7 @@ class SoundboardWindow(QMainWindow):
     def apply_local_filter(self, _text: str | None = None) -> None:
         query = self.local_search_input.text().strip().lower()
         self.local_list.clear()
-        tile_w = max(90, self.local_list.gridSize().width() - 12)
-        tile_h = int(tile_w / PHI)
+        tile_w, tile_h, _ = self._compute_local_tile_metrics()
         visual_idx = 0
         for name in self._local_all_items:
             if query and query not in name.lower():
@@ -1987,19 +2326,12 @@ class SoundboardWindow(QMainWindow):
             colors = self._build_random_tile_colors(key)
             self._local_tile_colors[key] = colors
         item.setData(int(Qt.ItemDataRole.UserRole), colors)
-        item.setForeground(QBrush(QColor("#f8fbff")))
+        item.setForeground(QBrush(QColor("#e2e8f0")))
         item.setToolTip(item.text())
 
     def _build_random_tile_colors(self, seed_text: str) -> tuple[str, str]:
-        rng = random.Random(seed_text)
-        h = rng.randint(0, 359)
-        s1 = rng.randint(145, 225)
-        v1 = rng.randint(185, 250)
-        s2 = min(255, s1 + rng.randint(10, 26))
-        v2 = max(85, v1 - rng.randint(45, 90))
-        c1 = QColor.fromHsv(h, s1, v1)
-        c2 = QColor.fromHsv((h + rng.randint(14, 34)) % 360, s2, v2)
-        return (c1.name(), c2.name())
+        _ = seed_text
+        return ("#334155", "#334155")
 
     def _animate_local_tile_click(self, item: QListWidgetItem) -> None:
         base_colors = item.data(int(Qt.ItemDataRole.UserRole))
@@ -2029,14 +2361,28 @@ class SoundboardWindow(QMainWindow):
         QTimer.singleShot(110, pulse_mid)
         QTimer.singleShot(230, restore)
 
-    def _update_local_grid_size(self) -> None:
-        cols = 5
-        spacing = self.local_list.spacing()
-        view_w = max(480, self.local_list.viewport().width())
+    def _compute_local_tile_metrics(self) -> tuple[int, int, int]:
+        spacing = max(12, self.local_list.spacing())
+        view_w = max(260, self.local_list.viewport().width())
+        min_tile_w = max(108, int(78 * PHI))
+        max_tile_w = 214
+        cols = max(1, min(6, int((view_w + spacing) / (min_tile_w + spacing))))
         tile_w = int((view_w - (spacing * (cols + 1))) / cols)
-        tile_w = max(int(62 * PHI), tile_w)
-        tile_h = max(44, int(tile_w / (PHI * 1.32)))
-        self.local_list.setGridSize(QSize(tile_w, tile_h + 12))
+        tile_w = max(min_tile_w, min(max_tile_w, tile_w))
+        tile_h = max(42, int(tile_w / (PHI * 1.18)))
+        return tile_w, tile_h, spacing
+
+    def _update_local_grid_size(self) -> None:
+        tile_w, tile_h, spacing = self._compute_local_tile_metrics()
+        self.local_list.setGridSize(QSize(tile_w + spacing, tile_h + 12))
+
+    def _refresh_local_item_size_hints(self) -> None:
+        tile_w, tile_h, _ = self._compute_local_tile_metrics()
+        size = QSize(tile_w, tile_h)
+        for idx in range(self.local_list.count()):
+            item = self.local_list.item(idx)
+            if item is not None:
+                item.setSizeHint(size)
 
     def play_selected_imported(self) -> None:
         if self._delete_mode:
@@ -2080,6 +2426,8 @@ class SoundboardWindow(QMainWindow):
         self._open_trim_editor_for_item(current)
 
     def _on_local_item_clicked(self, item: QListWidgetItem) -> None:
+        if self._delete_mode:
+            return
         self._animate_local_tile_click(item)
         if self._trim_mode:
             self._open_trim_editor_for_item(item)
@@ -2464,6 +2812,37 @@ class SoundboardWindow(QMainWindow):
         self.engine.soundboard.set_volume(gain)
         self.soundboard_volume_label.setText(f"Soundboard Volume: {slider_value}%")
 
+    def _sync_mic_noise_suppression_button(self) -> None:
+        available = self.engine.is_noise_suppression_available()
+        active = self.engine.is_noise_suppression_enabled() if available else False
+
+        was_blocked = self.mic_noise_suppression_btn.blockSignals(True)
+        self.mic_noise_suppression_btn.setChecked(active)
+        self.mic_noise_suppression_btn.blockSignals(was_blocked)
+
+        if not available:
+            self.mic_noise_suppression_btn.setEnabled(False)
+            self.mic_noise_suppression_btn.setText("Mic Noise Suppression: Unavailable")
+            err = self.engine.noise_suppression_error()
+            self.mic_noise_suppression_btn.setToolTip(err or "RNNoise backend unavailable.")
+            return
+
+        self.mic_noise_suppression_btn.setEnabled(True)
+        self.mic_noise_suppression_btn.setText("Mic Noise Suppression: On" if active else "Mic Noise Suppression: Off")
+        backend = self.engine.noise_suppression_backend()
+        self.mic_noise_suppression_btn.setToolTip(f"RNNoise backend: {backend}")
+
+    def toggle_mic_noise_suppression(self, enabled: bool) -> None:
+        active = self.engine.set_noise_suppression_enabled(enabled)
+        self._sync_mic_noise_suppression_button()
+        if enabled and not active:
+            err = self.engine.noise_suppression_error()
+            self.status_label.setText(err or "Mic noise suppression unavailable.")
+            return
+        self.status_label.setText(
+            "Mic noise suppression enabled." if active else "Mic noise suppression disabled."
+        )
+
     def toggle_speaker_monitor(self, enabled: bool) -> None:
         self.speaker_monitor_btn.setText("Play To Speaker: On" if enabled else "Play To Speaker: Off")
         self.speaker_monitor_label.setVisible(enabled)
@@ -2495,6 +2874,11 @@ class SoundboardWindow(QMainWindow):
     def update_preview_volume_label(self, slider_value: int) -> None:
         self.preview_volume_label.setText(f"Preview Volume: {slider_value}%")
 
+    def update_mic_volume_label(self, slider_value: int) -> None:
+        value = max(0, min(100, int(slider_value)))
+        self.mic_volume_label.setText(f"Mic Volume: {value}%")
+        self.engine.set_mic_input_gain(value / 100.0)
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.stop_remote_preview(silent=True)
         self.stop_trim_preview(silent=True)
@@ -2504,8 +2888,7 @@ class SoundboardWindow(QMainWindow):
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self._update_local_grid_size()
-        if not self._delete_mode:
-            self.apply_local_filter()
+        self._refresh_local_item_size_hints()
 
 
 def run_ui() -> int:
