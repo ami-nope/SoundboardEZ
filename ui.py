@@ -16,6 +16,7 @@ import numpy as np
 import requests
 import sounddevice as sd
 from PyQt6.QtCore import (
+    QEvent,
     QEasingCurve,
     QObject,
     QPointF,
@@ -34,6 +35,8 @@ from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
+    QFrame,
+    QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
     QGridLayout,
     QGroupBox,
@@ -443,12 +446,67 @@ class SmoothListWidget(QListWidget):
         event.accept()
 
 
+class ButtonMotionFilter(QObject):
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._effects: dict[QPushButton, QGraphicsDropShadowEffect] = {}
+        self._animations: dict[QPushButton, QPropertyAnimation] = {}
+        self._glow_colors: dict[QPushButton, QColor] = {}
+
+    def attach(self, button: QPushButton, glow: str = "#67e8f9") -> None:
+        if button in self._effects:
+            return
+        effect = QGraphicsDropShadowEffect(button)
+        effect.setBlurRadius(12.0)
+        effect.setOffset(0.0, 2.0)
+        effect.setColor(QColor(7, 14, 31, 155))
+        button.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"blurRadius", button)
+        anim.setDuration(150)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._effects[button] = effect
+        self._animations[button] = anim
+        self._glow_colors[button] = QColor(glow)
+        button.installEventFilter(self)
+
+    def _animate(self, button: QPushButton, blur: float, y_offset: float, color: QColor) -> None:
+        effect = self._effects.get(button)
+        anim = self._animations.get(button)
+        if effect is None or anim is None:
+            return
+        anim.stop()
+        anim.setStartValue(float(effect.blurRadius()))
+        anim.setEndValue(float(blur))
+        anim.start()
+        effect.setOffset(0.0, float(y_offset))
+        effect.setColor(color)
+
+    def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
+        if not isinstance(obj, QPushButton) or obj not in self._effects:
+            return super().eventFilter(obj, event)
+
+        glow = self._glow_colors.get(obj, QColor("#67e8f9"))
+        typ = event.type()
+        if typ == QEvent.Type.Enter:
+            self._animate(obj, blur=24.0, y_offset=0.0, color=QColor(glow.red(), glow.green(), glow.blue(), 150))
+        elif typ == QEvent.Type.Leave:
+            self._animate(obj, blur=12.0, y_offset=2.0, color=QColor(7, 14, 31, 155))
+        elif typ == QEvent.Type.MouseButtonPress:
+            self._animate(obj, blur=9.0, y_offset=1.0, color=QColor(glow.red(), glow.green(), glow.blue(), 110))
+        elif typ == QEvent.Type.MouseButtonRelease:
+            if obj.underMouse():
+                self._animate(obj, blur=24.0, y_offset=0.0, color=QColor(glow.red(), glow.green(), glow.blue(), 150))
+            else:
+                self._animate(obj, blur=12.0, y_offset=2.0, color=QColor(7, 14, 31, 155))
+        return super().eventFilter(obj, event)
+
+
 class LocalTileDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option, index) -> None:  # type: ignore[override]
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        rect = option.rect.adjusted(9, 7, -9, -7)
+        rect = option.rect.adjusted(8, 8, -8, -8)
         colors = index.data(int(Qt.ItemDataRole.UserRole))
         if not (isinstance(colors, tuple) and len(colors) == 2):
             colors = ("#4f46e5", "#3730a3")
@@ -460,17 +518,22 @@ class LocalTileDelegate(QStyledItemDelegate):
             c1 = c1.lighter(132)
             c2 = c2.lighter(132)
 
+        shadow_rect = rect.adjusted(1, 2, 1, 3)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(7, 14, 31, 105 if hovered else 82))
+        painter.drawRoundedRect(shadow_rect, 19, 19)
+
         grad = QLinearGradient(float(rect.left()), float(rect.top()), float(rect.right()), float(rect.bottom()))
         grad.setColorAt(0.0, c1)
         grad.setColorAt(1.0, c2)
         painter.setBrush(QBrush(grad))
 
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        border_color = QColor(255, 255, 255, 235) if selected else QColor(196, 214, 255, 92)
+        border_color = QColor(255, 255, 255, 238) if selected else QColor(196, 214, 255, 98)
         border_width = 2 if (selected or hovered) else 1
         pen = QPen(border_color, border_width)
         painter.setPen(pen)
-        painter.drawRoundedRect(rect, 16, 16)
+        painter.drawRoundedRect(rect, 18, 18)
 
         text = str(index.data(int(Qt.ItemDataRole.DisplayRole)) or "")
         text_rect = rect.adjusted(10, 0, -10, 0)
@@ -861,16 +924,46 @@ class SoundboardWindow(QMainWindow):
         self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
         self._engine_thread.start()
 
+        self._button_motion = ButtonMotionFilter(self)
+
         central = QWidget()
         central.setObjectName("Root")
         self.setCentralWidget(central)
         grid = QGridLayout(central)
-        grid.setContentsMargins(16, 16, 16, 12)
+        grid.setContentsMargins(18, 14, 18, 14)
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(12)
+        grid.setRowStretch(1, 1)
+
+        self.top_bar = QFrame()
+        self.top_bar.setObjectName("TopBar")
+        top_layout = QHBoxLayout(self.top_bar)
+        top_layout.setContentsMargins(16, 10, 16, 10)
+        top_layout.setSpacing(10)
+        self.app_logo = QLabel("SB")
+        self.app_logo.setObjectName("LogoBadge")
+        self.app_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_col = QVBoxLayout()
+        title_col.setContentsMargins(0, 0, 0, 0)
+        title_col.setSpacing(0)
+        self.app_title = QLabel("SoundboardEZ")
+        self.app_title.setObjectName("AppTitle")
+        self.app_subtitle = QLabel("Virtual Mic Mixer")
+        self.app_subtitle.setObjectName("AppSubtitle")
+        title_col.addWidget(self.app_title)
+        title_col.addWidget(self.app_subtitle)
+        self.status_label = QLabel("Ready")
+        self.status_label.setObjectName("StatusPill")
+        top_layout.addWidget(self.app_logo)
+        top_layout.addLayout(title_col)
+        top_layout.addStretch(1)
+        top_layout.addWidget(self.status_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        grid.addWidget(self.top_bar, 0, 0)
 
         self.left_group = QGroupBox("Importer")
-        self.left_group.setObjectName("PanelCard")
+        self.left_group.setObjectName("ImporterCard")
+        self.left_group.setMinimumWidth(430)
+        self.left_group.setMaximumWidth(500)
         left_layout = QGridLayout(self.left_group)
         left_layout.setContentsMargins(14, 18, 14, 12)
         left_layout.setHorizontalSpacing(8)
@@ -881,7 +974,7 @@ class SoundboardWindow(QMainWindow):
         self.import_search_btn.setProperty("variant", "primary")
         self.import_url_btn = QPushButton("Import Link")
         self.import_url_btn.setProperty("variant", "success")
-        self.close_importer_btn = QPushButton("✕")
+        self.close_importer_btn = QPushButton("X")
         self.close_importer_btn.setObjectName("ImporterClose")
         self.close_importer_btn.setToolTip("Close importer")
         self.fetch_btn = QPushButton("Reload Feed")
@@ -904,22 +997,24 @@ class SoundboardWindow(QMainWindow):
         left_layout.addWidget(self.fetch_btn, 1, 3)
         left_layout.addWidget(self.preview_volume_label, 2, 0, 1, 2)
         left_layout.addWidget(self.preview_volume_slider, 2, 2, 1, 4)
-        left_layout.addWidget(QLabel("Click Play or Import on any sound. More loads as you scroll."), 3, 0, 1, 6)
+        importer_hint = QLabel("Click Play or Import on any sound. More loads as you scroll.")
+        importer_hint.setObjectName("HintLabel")
+        left_layout.addWidget(importer_hint, 3, 0, 1, 6)
         left_layout.addWidget(self.remote_feed_list, 4, 0, 1, 6)
 
         self.right_group = QGroupBox("Your Soundboard")
-        self.right_group.setObjectName("PanelCard")
+        self.right_group.setObjectName("MainCard")
         right_layout = QHBoxLayout(self.right_group)
         right_layout.setContentsMargins(14, 18, 14, 12)
         right_layout.setSpacing(12)
         self.soundboard_sidebar = QWidget()
-        self.soundboard_sidebar.setObjectName("SoundboardSidebar")
-        sidebar_w = int(172 * PHI)
+        self.soundboard_sidebar.setObjectName("SideCard")
+        sidebar_w = 268
         self.soundboard_sidebar.setMinimumWidth(sidebar_w)
         self.soundboard_sidebar.setMaximumWidth(sidebar_w)
         sidebar_layout = QVBoxLayout(self.soundboard_sidebar)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar_layout.setSpacing(8)
+        sidebar_layout.setSpacing(10)
 
         self.soundboard_main = QWidget()
         self.soundboard_main.setObjectName("SoundboardMain")
@@ -975,8 +1070,10 @@ class SoundboardWindow(QMainWindow):
         self.local_title.setObjectName("SectionTitle")
         self._local_tile_colors: dict[str, tuple[str, str]] = {}
         self.delete_mode_hint = QLabel("Delete mode: tick sounds, then click Delete Checked")
+        self.delete_mode_hint.setObjectName("HintLabel")
         self.delete_mode_hint.setVisible(False)
         self.trim_mode_hint = QLabel("Trim mode: click a sound tile to open the trim window.")
+        self.trim_mode_hint.setObjectName("HintLabel")
         self.trim_mode_hint.setVisible(False)
         self.trim_dialog = TrimEditorDialog(self)
         self.trim_dialog.hide()
@@ -1007,8 +1104,12 @@ class SoundboardWindow(QMainWindow):
         sidebar_layout.addWidget(self.trim_mode_hint)
         sidebar_layout.addStretch(1)
 
-        main_layout.addWidget(self.local_title)
-        main_layout.addWidget(self.local_search_input)
+        local_header = QHBoxLayout()
+        local_header.setSpacing(10)
+        local_header.addWidget(self.local_title)
+        local_header.addStretch(1)
+        local_header.addWidget(self.local_search_input, 0)
+        main_layout.addLayout(local_header)
         main_layout.addWidget(self.local_list, 1)
 
         right_layout.addWidget(self.soundboard_sidebar)
@@ -1016,13 +1117,17 @@ class SoundboardWindow(QMainWindow):
 
         top_row = QHBoxLayout()
         top_row.setSpacing(14)
-        top_row.addWidget(self.left_group, 1000)
         top_row.addWidget(self.right_group, 1618)
-        grid.addLayout(top_row, 0, 0)
-
-        self.status_label = QLabel("Ready")
-        self.status_label.setObjectName("StatusPill")
-        self.status_label.setVisible(False)
+        top_row.addWidget(self.left_group, 1000)
+        grid.addLayout(top_row, 1, 0)
+        self._importer_fx = QGraphicsOpacityEffect(self.left_group)
+        self.left_group.setGraphicsEffect(self._importer_fx)
+        self._importer_fx.setOpacity(1.0)
+        self._importer_anim = QPropertyAnimation(self._importer_fx, b"opacity", self)
+        self._importer_anim.setDuration(190)
+        self._importer_anim.setStartValue(0.0)
+        self._importer_anim.setEndValue(1.0)
+        self._importer_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
         self.import_search_btn.clicked.connect(self.apply_import_search)
         self.import_url_btn.clicked.connect(self.import_from_link)
@@ -1055,6 +1160,7 @@ class SoundboardWindow(QMainWindow):
 
         self._apply_modern_theme()
         self._apply_button_ratios()
+        self._apply_button_motion()
         self._importer_loaded_once = False
         self._set_importer_visible(False)
         self.refresh_local()
@@ -1075,163 +1181,218 @@ class SoundboardWindow(QMainWindow):
             print(f"Audio engine error: {exc}")
 
     def _apply_button_ratios(self) -> None:
-        compact = [
+        sidebar_buttons = [
             self.toggle_importer_btn,
+            self.speaker_monitor_btn,
             self.play_local_btn,
             self.trim_local_btn,
             self.cancel_trim_btn,
             self.delete_local_btn,
             self.cancel_delete_btn,
-            self.import_file_btn,
             self.refresh_local_btn,
-            self.speaker_monitor_btn,
+        ]
+        for btn in sidebar_buttons:
+            btn.setMinimumHeight(38)
+            btn.setMaximumHeight(40)
+            btn.setMinimumWidth(220)
+
+        importer_buttons = [
             self.import_search_btn,
             self.import_url_btn,
             self.fetch_btn,
+            self.import_file_btn,
         ]
-        btn_h = 34
-        btn_min_w = int(btn_h * (PHI**3))  # ~144
-        btn_max_w = int(btn_h * (PHI**4))  # ~233
-        for btn in compact:
-            btn.setMinimumWidth(btn_min_w)
-            btn.setMaximumWidth(btn_max_w)
-            btn.setMinimumHeight(btn_h)
-            btn.setMaximumHeight(int(btn_h * 1.06))
-        self.close_importer_btn.setMaximumWidth(30)
-        self.close_importer_btn.setMinimumHeight(30)
+        for btn in importer_buttons:
+            btn.setMinimumHeight(34)
+            btn.setMaximumHeight(36)
+            btn.setMinimumWidth(96)
+            btn.setMaximumWidth(130)
+
+        self.close_importer_btn.setMinimumSize(30, 30)
+        self.close_importer_btn.setMaximumSize(30, 30)
+        self.local_search_input.setMinimumWidth(260)
+        self.import_search_input.setMinimumHeight(36)
 
     def _apply_modern_theme(self) -> None:
         self.setStyleSheet(
             """
             QWidget#Root {
-                background: qradialgradient(cx:0.18, cy:0.12, radius:1.1,
-                    fx:0.1, fy:0.08,
-                    stop:0 rgba(22, 95, 255, 0.34),
-                    stop:0.34 rgba(11, 16, 37, 0.94),
-                    stop:1 rgba(6, 9, 24, 1.0));
-                color: #ecf2ff;
-                font-family: "SF Pro Display", "Segoe UI Variable", "Segoe UI", sans-serif;
+                background: qradialgradient(cx:0.16, cy:0.08, radius:1.28,
+                    fx:0.08, fy:0.05,
+                    stop:0 rgba(48, 89, 255, 0.42),
+                    stop:0.34 rgba(13, 23, 56, 0.98),
+                    stop:1 rgba(4, 8, 24, 1.0));
+                color: #edf4ff;
+                font-family: "SF Pro Display", "Segoe UI Variable Text", "Segoe UI", sans-serif;
                 font-size: 13px;
             }
-            QGroupBox#PanelCard {
-                border: 1px solid rgba(196, 214, 255, 0.2);
+            QFrame#TopBar {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(255, 255, 255, 0.12),
+                    stop:1 rgba(255, 255, 255, 0.05));
+                border: 1px solid rgba(180, 207, 255, 0.22);
                 border-radius: 18px;
-                margin-top: 8px;
-                background-color: rgba(255, 255, 255, 0.07);
-                padding-top: 10px;
             }
-            QGroupBox#PanelCard::title {
+            QLabel#LogoBadge {
+                min-width: 32px;
+                max-width: 32px;
+                min-height: 32px;
+                max-height: 32px;
+                border-radius: 16px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(94, 234, 212, 0.95),
+                    stop:1 rgba(99, 102, 241, 0.95));
+                color: #061123;
+                font-size: 12px;
+                font-weight: 800;
+            }
+            QLabel#AppTitle {
+                color: #f8fbff;
+                font-size: 17px;
+                font-weight: 750;
+                letter-spacing: 0.3px;
+            }
+            QLabel#AppSubtitle {
+                color: rgba(220, 233, 255, 0.78);
+                font-size: 12px;
+                font-weight: 500;
+            }
+            QGroupBox#MainCard,
+            QGroupBox#ImporterCard,
+            QGroupBox#SideCard {
+                background: qlineargradient(x1:0, y1:0, x2:0.9, y2:1,
+                    stop:0 rgba(255, 255, 255, 0.10),
+                    stop:1 rgba(255, 255, 255, 0.04));
+                border: 1px solid rgba(190, 214, 255, 0.24);
+                border-radius: 20px;
+                margin-top: 10px;
+                padding-top: 11px;
+            }
+            QGroupBox#MainCard::title,
+            QGroupBox#ImporterCard::title,
+            QGroupBox#SideCard::title {
                 subcontrol-origin: margin;
-                left: 14px;
-                padding: 4px 10px;
-                color: #f0f6ff;
+                left: 16px;
+                padding: 3px 12px;
+                color: #f3f8ff;
                 font-weight: 700;
-                background-color: rgba(6, 16, 43, 0.9);
-                border-radius: 10px;
-                border: 1px solid rgba(56, 189, 248, 0.35);
+                background: rgba(10, 22, 54, 0.92);
+                border: 1px solid rgba(124, 223, 255, 0.42);
+                border-radius: 11px;
             }
-            QWidget#SoundboardSidebar {
-                background: rgba(10, 22, 56, 0.58);
-                border: 1px solid rgba(141, 174, 252, 0.25);
-                border-radius: 14px;
-                padding: 8px;
+            QWidget#SideCard {
+                background: rgba(9, 21, 56, 0.50);
+                border-radius: 18px;
             }
             QWidget#SoundboardMain {
-                background: rgba(8, 16, 44, 0.48);
-                border: 1px solid rgba(141, 174, 252, 0.2);
-                border-radius: 14px;
-                padding: 8px;
+                background: rgba(7, 16, 43, 0.48);
+                border: 1px solid rgba(167, 196, 255, 0.20);
+                border-radius: 18px;
+                padding: 6px;
             }
             QLabel#SectionTitle {
-                font-size: 16px;
-                font-weight: 700;
-                color: #f3f7ff;
-                padding-left: 2px;
+                font-size: 18px;
+                font-weight: 730;
+                color: #f6fbff;
+                letter-spacing: 0.2px;
             }
             QLabel {
-                color: #d7e2ff;
+                color: #dbe7ff;
+            }
+            QLabel#HintLabel {
+                color: rgba(212, 229, 255, 0.78);
+                font-size: 11px;
+            }
+            QLabel#FeedNameLabel {
+                color: #edf4ff;
+                font-size: 13px;
+                font-weight: 560;
             }
             QLabel#StatusPill {
-                background: rgba(59, 130, 246, 0.2);
-                color: #f2f8ff;
-                border: 1px solid rgba(167, 207, 255, 0.5);
-                border-radius: 12px;
-                padding: 9px 13px;
-                font-weight: 600;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(12, 31, 80, 0.86),
+                    stop:1 rgba(20, 58, 131, 0.72));
+                color: #f3f8ff;
+                border: 1px solid rgba(128, 229, 255, 0.65);
+                border-radius: 14px;
+                padding: 8px 13px;
+                font-weight: 650;
             }
             QLineEdit {
-                background: rgba(9, 18, 45, 0.62);
-                border: 1px solid rgba(140, 177, 255, 0.3);
-                border-radius: 12px;
-                padding: 8px 11px;
-                selection-background-color: rgba(56, 189, 248, 0.6);
+                background: rgba(9, 20, 49, 0.62);
+                border: 1px solid rgba(143, 187, 255, 0.35);
+                border-radius: 14px;
+                padding: 8px 12px;
+                selection-background-color: rgba(83, 204, 255, 0.65);
                 color: #eef4ff;
             }
             QLineEdit:focus {
-                border: 1px solid rgba(56, 189, 248, 0.9);
-                background: rgba(13, 24, 62, 0.83);
+                border: 1px solid rgba(91, 219, 255, 0.92);
+                background: rgba(13, 26, 68, 0.88);
             }
             QPushButton {
-                border-radius: 999px;
-                border: 1px solid rgba(190, 212, 255, 0.22);
-                padding: 6px 12px;
-                min-height: 30px;
+                border-radius: 18px;
+                border: 1px solid rgba(194, 220, 255, 0.34);
+                padding: 6px 14px;
+                min-height: 34px;
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(255,255,255,0.17),
-                    stop:1 rgba(255,255,255,0.07));
+                    stop:0 rgba(255,255,255,0.23),
+                    stop:1 rgba(255,255,255,0.10));
                 color: #f5f8ff;
-                font-weight: 700;
+                font-weight: 680;
             }
             QPushButton:hover {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(255,255,255,0.23),
-                    stop:1 rgba(255,255,255,0.12));
-                border-color: rgba(165, 202, 255, 0.65);
+                    stop:0 rgba(255,255,255,0.30),
+                    stop:1 rgba(255,255,255,0.16));
+                border-color: rgba(132, 238, 255, 0.74);
             }
             QPushButton:pressed {
-                background: rgba(255, 255, 255, 0.32);
+                padding-top: 8px;
+                padding-bottom: 4px;
+                background: rgba(255, 255, 255, 0.23);
             }
             QPushButton[variant="primary"] {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(76, 160, 255, 0.55),
-                    stop:1 rgba(30, 106, 250, 0.44));
-                border-color: rgba(131, 196, 255, 0.82);
+                    stop:0 rgba(86, 197, 255, 0.68),
+                    stop:1 rgba(36, 112, 255, 0.58));
+                border-color: rgba(143, 225, 255, 0.90);
             }
             QPushButton[variant="success"] {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(22, 224, 157, 0.52),
-                    stop:1 rgba(11, 166, 126, 0.42));
-                border-color: rgba(104, 255, 204, 0.8);
+                    stop:0 rgba(34, 219, 169, 0.68),
+                    stop:1 rgba(11, 163, 124, 0.56));
+                border-color: rgba(119, 255, 216, 0.86);
             }
             QPushButton[variant="danger"] {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(255, 98, 129, 0.55),
-                    stop:1 rgba(226, 55, 96, 0.42));
-                border-color: rgba(255, 167, 187, 0.82);
+                    stop:0 rgba(255, 106, 146, 0.70),
+                    stop:1 rgba(215, 48, 96, 0.58));
+                border-color: rgba(255, 182, 204, 0.90);
             }
             QPushButton[variant="violet"] {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(167, 110, 255, 0.58),
-                    stop:1 rgba(116, 70, 220, 0.45));
-                border-color: rgba(208, 177, 255, 0.82);
+                    stop:0 rgba(178, 121, 255, 0.72),
+                    stop:1 rgba(118, 74, 224, 0.58));
+                border-color: rgba(216, 188, 255, 0.90);
             }
             QPushButton[variant="cyan"] {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(38, 211, 238, 0.58),
-                    stop:1 rgba(14, 148, 184, 0.45));
-                border-color: rgba(153, 246, 228, 0.82);
+                    stop:0 rgba(55, 219, 255, 0.72),
+                    stop:1 rgba(10, 149, 202, 0.58));
+                border-color: rgba(150, 242, 255, 0.90);
             }
             QPushButton[variant="amber"] {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(251, 191, 36, 0.62),
-                    stop:1 rgba(217, 119, 6, 0.46));
-                border-color: rgba(254, 215, 170, 0.88);
+                    stop:0 rgba(253, 211, 75, 0.72),
+                    stop:1 rgba(217, 126, 20, 0.56));
+                border-color: rgba(254, 226, 183, 0.90);
             }
             QPushButton[variant="slate"] {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(100, 116, 139, 0.56),
-                    stop:1 rgba(71, 85, 105, 0.46));
-                border-color: rgba(203, 213, 225, 0.62);
+                    stop:0 rgba(129, 145, 171, 0.58),
+                    stop:1 rgba(86, 99, 128, 0.52));
+                border-color: rgba(213, 223, 238, 0.76);
             }
             QPushButton#ImporterClose {
                 min-width: 30px;
@@ -1240,32 +1401,32 @@ class SoundboardWindow(QMainWindow):
                 max-height: 30px;
                 border-radius: 15px;
                 padding: 0;
-                background: rgba(255, 86, 117, 0.45);
-                border: 1px solid rgba(255, 160, 182, 0.82);
+                background: rgba(255, 94, 126, 0.60);
+                border: 1px solid rgba(255, 170, 192, 0.85);
                 color: #fff1f5;
                 font-weight: 700;
             }
             QPushButton#ImporterClose:hover {
-                background: rgba(255, 86, 117, 0.7);
+                background: rgba(255, 86, 117, 0.82);
             }
             QListWidget {
-                background: rgba(7, 16, 41, 0.6);
-                border: 1px solid rgba(153, 184, 255, 0.24);
-                border-radius: 14px;
-                padding: 6px;
+                background: rgba(6, 14, 39, 0.60);
+                border: 1px solid rgba(160, 195, 255, 0.26);
+                border-radius: 18px;
+                padding: 8px;
                 outline: none;
             }
             QListWidget#LocalSoundGrid {
-                background: rgba(6, 14, 36, 0.52);
-                border: 1px solid rgba(150, 178, 244, 0.22);
-                border-radius: 16px;
-                padding: 10px;
+                background: rgba(5, 12, 34, 0.56);
+                border: 1px solid rgba(152, 188, 255, 0.26);
+                border-radius: 20px;
+                padding: 12px;
             }
             QListWidget#LocalSoundGrid::item {
-                border: 1px solid rgba(196, 214, 255, 0.34);
-                border-radius: 14px;
-                padding: 7px 10px;
-                margin: 3px;
+                border: 1px solid rgba(196, 214, 255, 0.30);
+                border-radius: 16px;
+                padding: 8px 10px;
+                margin: 4px;
                 color: #f8fbff;
                 font-weight: 700;
             }
@@ -1284,32 +1445,32 @@ class SoundboardWindow(QMainWindow):
                 color: #ffffff;
             }
             QSlider::groove:horizontal {
-                border-radius: 6px;
+                border-radius: 7px;
                 height: 10px;
-                background: rgba(113, 142, 208, 0.35);
+                background: rgba(120, 150, 218, 0.30);
             }
             QSlider::sub-page:horizontal {
-                border-radius: 6px;
+                border-radius: 7px;
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 rgba(74, 222, 255, 0.95),
-                    stop:1 rgba(76, 130, 255, 0.95));
+                    stop:0 rgba(78, 233, 255, 0.96),
+                    stop:1 rgba(96, 128, 255, 0.96));
             }
             QSlider::handle:horizontal {
                 background: #f8fbff;
-                border: 1px solid rgba(158, 188, 255, 0.95);
-                width: 18px;
+                border: 1px solid rgba(158, 198, 255, 0.95);
+                width: 19px;
                 margin: -6px 0;
                 border-radius: 9px;
             }
             QScrollBar:vertical {
                 background: transparent;
-                width: 12px;
+                width: 10px;
                 margin: 3px;
             }
             QScrollBar::handle:vertical {
-                background: rgba(119, 157, 235, 0.55);
-                border: 1px solid rgba(165, 199, 255, 0.55);
-                border-radius: 6px;
+                background: rgba(132, 171, 247, 0.62);
+                border: 1px solid rgba(185, 218, 255, 0.62);
+                border-radius: 5px;
                 min-height: 34px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
@@ -1318,13 +1479,55 @@ class SoundboardWindow(QMainWindow):
             """
         )
 
+    def _apply_button_motion(self) -> None:
+        buttons = [
+            self.toggle_importer_btn,
+            self.speaker_monitor_btn,
+            self.play_local_btn,
+            self.trim_local_btn,
+            self.cancel_trim_btn,
+            self.delete_local_btn,
+            self.cancel_delete_btn,
+            self.refresh_local_btn,
+            self.import_search_btn,
+            self.import_url_btn,
+            self.fetch_btn,
+            self.import_file_btn,
+            self.close_importer_btn,
+            self.trim_play_pause_btn,
+            self.trim_stop_btn,
+            self.apply_trim_btn,
+            self.close_trim_editor_btn,
+        ]
+        for btn in buttons:
+            variant = str(btn.property("variant") or "")
+            if variant == "danger":
+                glow = "#fb7185"
+            elif variant == "success":
+                glow = "#34d399"
+            elif variant == "violet":
+                glow = "#a78bfa"
+            elif variant == "cyan":
+                glow = "#22d3ee"
+            else:
+                glow = "#67e8f9"
+            self._button_motion.attach(btn, glow=glow)
+
     def _run_entrance_animation(self) -> None:
-        for widget, start_ms in ((self.left_group, 0), (self.right_group, 80)):
+        sequence = [
+            (self.top_bar, 0),
+            (self.soundboard_sidebar, 70),
+            (self.right_group, 120),
+            (self.left_group, 180),
+        ]
+        for widget, start_ms in sequence:
+            if not widget.isVisible():
+                continue
             fx = QGraphicsOpacityEffect(widget)
             widget.setGraphicsEffect(fx)
             fx.setOpacity(0.0)
             anim = QPropertyAnimation(fx, b"opacity", self)
-            anim.setDuration(420)
+            anim.setDuration(460)
             anim.setStartValue(0.0)
             anim.setEndValue(1.0)
             anim.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -1353,7 +1556,13 @@ class SoundboardWindow(QMainWindow):
         thread.start()
 
     def _set_importer_visible(self, visible: bool) -> None:
-        self.left_group.setVisible(visible)
+        if visible:
+            self.left_group.setVisible(True)
+            self._importer_anim.stop()
+            self._importer_fx.setOpacity(0.0)
+            self._importer_anim.start()
+        else:
+            self.left_group.setVisible(False)
         self.toggle_importer_btn.setText("Close Importer" if visible else "Open Importer")
         if visible and not self._importer_loaded_once:
             self.fetch_sounds()
@@ -1513,16 +1722,17 @@ class SoundboardWindow(QMainWindow):
         row_item = QListWidgetItem()
         row_widget = QWidget()
         row_layout = QHBoxLayout(row_widget)
-        row_layout.setContentsMargins(12, 5, 12, 5)
-        row_layout.setSpacing(12)
-        row_widget.setMinimumHeight(40)
+        row_layout.setContentsMargins(10, 6, 10, 6)
+        row_layout.setSpacing(10)
+        row_widget.setMinimumHeight(46)
 
         name_lbl = QLabel(item.name)
+        name_lbl.setObjectName("FeedNameLabel")
         name_lbl.setToolTip(item.url)
         play_btn = QPushButton("Play")
-        row_btn_h = 26
-        play_btn_w = int(row_btn_h * 2.6)  # ~67
-        import_btn_w = int(play_btn_w * PHI)  # ~108
+        row_btn_h = 30
+        play_btn_w = 84
+        import_btn_w = 112
         play_btn.setFixedSize(play_btn_w, row_btn_h)
         import_btn = QPushButton("Import")
         import_btn.setFixedSize(import_btn_w, row_btn_h)
@@ -1535,7 +1745,7 @@ class SoundboardWindow(QMainWindow):
         row_layout.addWidget(play_btn)
         row_layout.addWidget(import_btn)
 
-        row_item.setSizeHint(QSize(0, 52))
+        row_item.setSizeHint(QSize(0, 58))
         row_widget.mouseDoubleClickEvent = lambda _event, it=item: self.toggle_remote_play(it)  # type: ignore[attr-defined]
         self.remote_feed_list.addItem(row_item)
         self.remote_feed_list.setItemWidget(row_item, row_widget)
@@ -1562,12 +1772,12 @@ class SoundboardWindow(QMainWindow):
         play_btn.setStyleSheet(
             f"""
             QPushButton {{
-                border-radius: 13px;
-                border: 1px solid rgba(220,235,255,0.68);
+                border-radius: 15px;
+                border: 1px solid rgba(220,235,255,0.80);
                 font-size: 12px;
                 font-weight: 700;
                 min-height: 0px;
-                max-height: 26px;
+                max-height: 30px;
                 padding: 0px 10px;
                 color: #f8fbff;
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {pc1}, stop:1 {pc2});
@@ -1576,19 +1786,19 @@ class SoundboardWindow(QMainWindow):
                 border-color: rgba(255,255,255,0.98);
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255,255,255,0.36), stop:1 {pc2});
             }}
-            QPushButton:pressed {{ background: rgba(255,255,255,0.22); }}
+            QPushButton:pressed {{ padding-top: 2px; background: rgba(255,255,255,0.22); }}
             QPushButton:disabled {{ background: rgba(107,114,128,0.55); color: rgba(255,255,255,0.8); }}
             """
         )
         import_btn.setStyleSheet(
             f"""
             QPushButton {{
-                border-radius: 13px;
-                border: 1px solid rgba(220,255,240,0.7);
+                border-radius: 15px;
+                border: 1px solid rgba(220,255,240,0.86);
                 font-size: 12px;
                 font-weight: 700;
                 min-height: 0px;
-                max-height: 26px;
+                max-height: 30px;
                 padding: 0px 10px;
                 color: #f8fbff;
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {ic1}, stop:1 {ic2});
@@ -1597,9 +1807,11 @@ class SoundboardWindow(QMainWindow):
                 border-color: rgba(255,255,255,0.98);
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(255,255,255,0.34), stop:1 {ic2});
             }}
-            QPushButton:pressed {{ background: rgba(255,255,255,0.22); }}
+            QPushButton:pressed {{ padding-top: 2px; background: rgba(255,255,255,0.22); }}
             """
         )
+        self._button_motion.attach(play_btn, glow=pc1)
+        self._button_motion.attach(import_btn, glow=ic1)
 
     def toggle_remote_play(self, item: RemoteSoundItem) -> None:
         if self._current_preview_url == item.url:
