@@ -25,8 +25,10 @@ class Soundboard:
         self.hotkeys: dict[str, str] = {}  # hotkey -> sound name
         self._active: list[dict[str, object]] = []
         self._lock = threading.Lock()
-        self._registered_hotkeys: list[str] = []
+        self._hotkey_handles: dict[str, object] = {}
         self._volume = 1.0  # soundboard gain (0.0 = mute, 1.0 = unity)
+        self._max_active_playbacks = 64
+        self._enabled = True
 
     def set_volume(self, volume: float) -> None:
         clamped = max(0.0, min(2.0, float(volume)))
@@ -36,6 +38,18 @@ class Soundboard:
     def get_volume(self) -> float:
         with self._lock:
             return self._volume
+
+    def set_enabled(self, enabled: bool) -> bool:
+        target = bool(enabled)
+        with self._lock:
+            self._enabled = target
+            if not target:
+                self._active.clear()
+        return target
+
+    def is_enabled(self) -> bool:
+        with self._lock:
+            return bool(self._enabled)
 
     def load_wav(self, name: str, path: str | Path) -> None:
         audio, file_rate = _read_wav_float32(path)
@@ -64,10 +78,15 @@ class Soundboard:
     def bind_hotkey(self, hotkey: str, sound_name: str) -> None:
         if sound_name not in self.sounds:
             raise KeyError(f"Unknown sound '{sound_name}'")
+        old_handle = self._hotkey_handles.get(hotkey)
+        if old_handle is not None:
+            try:
+                keyboard.remove_hotkey(old_handle)
+            except Exception:
+                pass
         self.hotkeys[hotkey] = sound_name
-
         handle = keyboard.add_hotkey(hotkey, self.trigger, args=(sound_name,))
-        self._registered_hotkeys.append(handle)
+        self._hotkey_handles[hotkey] = handle
 
     def bind_hotkeys_auto(self) -> dict[str, str]:
         default_keys = list("1234567890qwertyuiopasdfghjklzxcvbnm")
@@ -78,9 +97,12 @@ class Soundboard:
         return mapping
 
     def clear_hotkeys(self) -> None:
-        for handle in self._registered_hotkeys:
-            keyboard.remove_hotkey(handle)
-        self._registered_hotkeys.clear()
+        for handle in list(self._hotkey_handles.values()):
+            try:
+                keyboard.remove_hotkey(handle)
+            except Exception:
+                pass
+        self._hotkey_handles.clear()
         self.hotkeys.clear()
 
     def trigger(self, sound_name: str) -> None:
@@ -88,18 +110,29 @@ class Soundboard:
         if sound is None:
             return
         with self._lock:
+            if not self._enabled:
+                return
+            if len(self._active) >= self._max_active_playbacks:
+                self._active = self._active[-(self._max_active_playbacks - 1) :]
             self._active.append({"audio": sound.audio, "pos": 0})
+
+    def stop_all(self) -> None:
+        with self._lock:
+            self._active.clear()
 
     def mix_into(self, outdata: np.ndarray) -> None:
         with self._lock:
-            if not self._active:
+            if not self._enabled or not self._active:
                 return
-
-            frames, out_channels = outdata.shape
-            still_active: list[dict[str, object]] = []
+            playbacks = self._active
+            self._active = []
             volume = self._volume
 
-            for playback in self._active:
+        frames, out_channels = outdata.shape
+        still_active: list[dict[str, object]] = []
+
+        for playback in playbacks:
+            try:
                 audio = playback["audio"]  # type: ignore[assignment]
                 pos = playback["pos"]  # type: ignore[assignment]
                 audio = audio  # type: ignore[no-redef]
@@ -117,11 +150,18 @@ class Soundboard:
                 if pos < audio.shape[0]:
                     playback["pos"] = pos
                     still_active.append(playback)
+            except Exception:
+                continue
 
+        with self._lock:
+            if self._active:
+                still_active.extend(self._active)
             self._active = still_active
 
 
 def _mix_chunk_to_channels(out_chunk: np.ndarray, src_chunk: np.ndarray, out_channels: int, volume: float = 1.0) -> None:
+    if volume <= 0.0:
+        return
     src_channels = src_chunk.shape[1]
     if src_channels == out_channels:
         out_chunk += src_chunk * volume

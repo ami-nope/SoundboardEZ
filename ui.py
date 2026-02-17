@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from urllib.parse import parse_qs, quote_plus, urlparse
 import wave
 
@@ -17,6 +18,7 @@ import sounddevice as sd
 from PyQt6.QtCore import (
     QEvent,
     QEasingCurve,
+    QLockFile,
     QObject,
     QPoint,
     QPointF,
@@ -27,9 +29,10 @@ from PyQt6.QtCore import (
     QThread,
     QTimer,
     QPropertyAnimation,
+    pyqtProperty,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QBrush, QPainter, QPen
+from PyQt6.QtGui import QAction, QColor, QBrush, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QRegion
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -39,7 +42,6 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -49,19 +51,24 @@ from PyQt6.QtWidgets import (
     QListView,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QPushButton,
+    QInputDialog,
     QScrollArea,
     QSpacerItem,
     QSizePolicy,
     QSlider,
     QStyle,
     QStyledItemDelegate,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
 
 from audio_engine import AudioEngine
+from app_state import AppState, load_app_state, save_app_state
 from scraper import MYINSTANTS_INDEX_URL, fetch_myinstants_sounds_page
+from startup_manager import STARTUP_ARG, is_startup_enabled, set_startup_enabled
 
 PHI = 1.618
 
@@ -70,6 +77,117 @@ PHI = 1.618
 class RemoteSoundItem:
     name: str
     url: str
+
+
+@dataclass
+class RuntimeVolumeState:
+    preview_gain: float = 0.08
+    mic_gain: float = 0.6
+    soundboard_gain: float = 0.15
+    speaker_gain: float = 0.02
+
+
+class ManagedOutputPlayer:
+    def __init__(self, gain: float = 1.0) -> None:
+        self._lock = threading.Lock()
+        self._stream: sd.OutputStream | None = None
+        self._active = False
+        self._gain = max(0.0, min(2.0, float(gain)))
+
+    def set_gain(self, gain: float) -> None:
+        value = max(0.0, min(2.0, float(gain)))
+        with self._lock:
+            self._gain = value
+
+    def is_active(self) -> bool:
+        with self._lock:
+            return bool(self._active and self._stream is not None)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_locked()
+
+    def close(self) -> None:
+        self.stop()
+
+    def _stop_locked(self) -> None:
+        stream = self._stream
+        self._stream = None
+        self._active = False
+        if stream is None:
+            return
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+    def play(
+        self,
+        audio: np.ndarray,
+        samplerate: int,
+        device: str | int | None = None,
+    ) -> None:
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        if arr.ndim != 2 or arr.shape[0] <= 0 or arr.shape[1] <= 0:
+            raise ValueError("ManagedOutputPlayer requires non-empty 1D/2D audio array.")
+        arr = np.ascontiguousarray(np.clip(arr, -1.0, 1.0), dtype=np.float32)
+        channels = int(arr.shape[1])
+
+        with self._lock:
+            self._stop_locked()
+            self._active = True
+
+        position = 0
+
+        def callback(outdata, frames, _time, _status):
+            nonlocal position
+            end = min(position + frames, arr.shape[0])
+            n = end - position
+            outdata.fill(0.0)
+            if n > 0:
+                out_view = outdata[:n, :channels]
+                out_view[:] = arr[position:end]
+                with self._lock:
+                    gain_now = float(self._gain)
+                if gain_now != 1.0:
+                    out_view *= np.float32(gain_now)
+                    np.clip(out_view, -1.0, 1.0, out=out_view)
+            position = end
+            if position >= arr.shape[0]:
+                raise sd.CallbackStop
+
+        holder: dict[str, sd.OutputStream | None] = {"stream": None}
+
+        def finished_callback() -> None:
+            stream_ref = holder["stream"]
+            if stream_ref is not None:
+                try:
+                    stream_ref.close()
+                except Exception:
+                    pass
+            with self._lock:
+                self._active = False
+                if self._stream is holder["stream"]:
+                    self._stream = None
+
+        stream = sd.OutputStream(
+            samplerate=int(samplerate),
+            channels=channels,
+            dtype="float32",
+            device=device,
+            callback=callback,
+            finished_callback=finished_callback,
+        )
+        holder["stream"] = stream
+        with self._lock:
+            self._stream = stream
+        stream.start()
 
 
 def _safe_name(name: str) -> str:
@@ -140,10 +258,10 @@ def _decode_audio_for_preview(path: Path) -> tuple[np.ndarray, int]:
         ]
         result = subprocess.run(cmd, capture_output=True)
         if result.returncode == 0 and result.stdout:
-            pcm = np.frombuffer(result.stdout, dtype=np.float32)
+            pcm = np.array(np.frombuffer(result.stdout, dtype=np.float32), copy=True)
             frames = pcm.size // ch
             if frames > 0:
-                return pcm[: frames * ch].reshape(frames, ch), sr
+                return np.ascontiguousarray(pcm[: frames * ch].reshape(frames, ch), dtype=np.float32), sr
 
     if path.suffix.lower() == ".wav":
         return _read_wav_float32(path)
@@ -393,10 +511,10 @@ class PreviewWorker(QObject):
                 temp_src = src_path
 
             audio, sr = _decode_audio_for_preview(src_path)
-            if self.volume < 1.0:
-                audio = audio * self.volume
             np.clip(audio, -1.0, 1.0, out=audio)
-            self.finished.emit({"item": self.item, "audio": audio, "sr": sr})
+            self.finished.emit(
+                {"item": self.item, "audio": np.ascontiguousarray(audio, dtype=np.float32), "sr": sr}
+            )
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -504,6 +622,120 @@ class ButtonMotionFilter(QObject):
         return super().eventFilter(obj, event)
 
 
+class MacTrafficButton(QPushButton):
+    def __init__(self, role: str, parent: QWidget | None = None) -> None:
+        super().__init__("", parent)
+        self._role = "close" if str(role).lower() == "close" else "minimize"
+        self._hovered = False
+        self._scale_factor = 1.0
+        self._scale_anim = QPropertyAnimation(self, b"scaleFactor", self)
+        self._scale_anim.setDuration(160)
+        self._scale_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        self.setFixedSize(16, 16)
+        self.setFlat(True)
+        self.setCheckable(False)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    @pyqtProperty(float)
+    def scaleFactor(self) -> float:
+        return float(self._scale_factor)
+
+    @scaleFactor.setter
+    def scaleFactor(self, value: float) -> None:
+        self._scale_factor = float(max(0.9, min(1.2, value)))
+        self.update()
+
+    def _animate_scale(self, target: float) -> None:
+        self._scale_anim.stop()
+        self._scale_anim.setStartValue(float(self._scale_factor))
+        self._scale_anim.setEndValue(float(target))
+        self._scale_anim.start()
+
+    def enterEvent(self, event) -> None:  # type: ignore[override]
+        self._hovered = True
+        self._animate_scale(1.05)
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        self._hovered = False
+        self._animate_scale(1.0)
+        self.update()
+        super().leaveEvent(event)
+
+    def _base_color(self) -> QColor:
+        if self._role == "close":
+            return QColor("#FF5F57")
+        return QColor("#F4BF4F")
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        _ = event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        rect = QRectF(self.rect()).adjusted(0.8, 0.8, -0.8, -0.8)
+        if self._scale_factor != 1.0:
+            center = rect.center()
+            width = rect.width() * self._scale_factor
+            height = rect.height() * self._scale_factor
+            rect = QRectF(center.x() - (width * 0.5), center.y() - (height * 0.5), width, height)
+
+        side = min(rect.width(), rect.height())
+        rect = QRectF(
+            rect.center().x() - (side * 0.5),
+            rect.center().y() - (side * 0.5),
+            side,
+            side,
+        )
+        path = QPainterPath()
+        path.addEllipse(rect)
+
+        base = self._base_color()
+        if self._hovered:
+            base = base.lighter(106)
+
+        grad = QLinearGradient(rect.left(), rect.top(), rect.left(), rect.bottom())
+        grad.setColorAt(0.0, base.lighter(120))
+        grad.setColorAt(0.52, base)
+        grad.setColorAt(1.0, base.darker(122))
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(grad)
+        painter.drawPath(path)
+
+        border_pen = QPen(QColor(14, 22, 35, 72), 0.9)
+        painter.setPen(border_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+
+        top_highlight_pen = QPen(QColor(255, 255, 255, 58), 0.9)
+        painter.setPen(top_highlight_pen)
+        painter.drawLine(
+            QPointF(rect.left() + 3.0, rect.top() + 2.0),
+            QPointF(rect.right() - 3.0, rect.top() + 2.0),
+        )
+
+        inner_shadow_pen = QPen(QColor(0, 0, 0, 54), 1.0)
+        painter.setPen(inner_shadow_pen)
+        painter.drawLine(
+            QPointF(rect.left() + 3.1, rect.bottom() - 1.9),
+            QPointF(rect.right() - 3.1, rect.bottom() - 1.9),
+        )
+
+        if self._hovered:
+            icon_pen = QPen(QColor(24, 32, 44, 155), 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            painter.setPen(icon_pen)
+            mid_x = rect.center().x()
+            mid_y = rect.center().y()
+            if self._role == "minimize":
+                painter.drawLine(QPointF(mid_x - 2.6, mid_y + 0.2), QPointF(mid_x + 2.6, mid_y + 0.2))
+            else:
+                painter.drawLine(QPointF(mid_x - 2.0, mid_y - 2.0), QPointF(mid_x + 2.0, mid_y + 2.0))
+                painter.drawLine(QPointF(mid_x + 2.0, mid_y - 2.0), QPointF(mid_x - 2.0, mid_y + 2.0))
+
+
 class LocalTileDelegate(QStyledItemDelegate):
     @staticmethod
     def _toggle_check_state(model, index) -> None:
@@ -544,44 +776,46 @@ class LocalTileDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        rect = option.rect.adjusted(8, 8, -8, -8)
+        rect = option.rect.adjusted(10, 8, -10, -8)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         checked = index.data(int(Qt.ItemDataRole.CheckStateRole)) == Qt.CheckState.Checked
-
-        base_color = QColor("#334155")
         if hovered:
-            base_color = QColor("#3f4f66")
+            rect.translate(0, -2)
+
+        base_color = QColor(60, 78, 102, 180)
+        if hovered:
+            base_color = QColor(80, 106, 146, 196)
         if selected:
-            base_color = QColor("#425a76")
+            base_color = QColor(96, 138, 190, 215)
 
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(2, 8, 23, 76))
-        painter.drawRoundedRect(rect.adjusted(0, 1, 0, 1), 14, 14)
+        painter.setBrush(QColor(8, 16, 28, 78))
+        painter.drawRoundedRect(rect.adjusted(0, 2, 0, 2), 14, 14)
 
-        border_color = QColor("#475569")
-        border_width = 2 if (selected or hovered) else 1
+        border_color = QColor(180, 200, 230, 62)
+        border_width = 1
         if hovered and not selected:
-            border_color = QColor(56, 189, 248, 125)
+            border_color = QColor(180, 220, 255, 120)
         if selected:
-            border_color = QColor(56, 189, 248, 225)
+            border_color = QColor(190, 235, 255, 185)
 
         painter.setBrush(base_color)
         pen = QPen(border_color, border_width)
         painter.setPen(pen)
         painter.drawRoundedRect(rect, 14, 14)
 
-        if hovered or selected:
-            glow_alpha = 28 if hovered else 42
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(56, 189, 248, glow_alpha))
-            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 13, 13)
-
         text = str(index.data(int(Qt.ItemDataRole.DisplayRole)) or "")
         text_rect = rect.adjusted(10, 0, -10, 0)
+        if index.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            text_rect.adjust(0, 0, -18, 0)
         text = option.fontMetrics.elidedText(text, Qt.TextElideMode.ElideRight, text_rect.width())
+        tile_font = QFont(option.font)
+        tile_font.setPointSize(9)
+        tile_font.setWeight(QFont.Weight.Medium)
+        painter.setFont(tile_font)
         painter.setPen(QColor("#e2e8f0"))
-        painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignCenter), text)
+        painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
 
         if index.flags() & Qt.ItemFlag.ItemIsUserCheckable:
             check_rect = QRect(rect.right() - 20, rect.top() + 6, 12, 12)
@@ -949,12 +1183,24 @@ class FramelessImporterDialog(QDialog):
 
 class SoundboardWindow(QMainWindow):
     DEFAULT_KEYS = list("1234567890qwertyuiopasdfghjklzxcvbnm")
+    DEFAULT_MIC_VOLUME = 60
+    DEFAULT_SOUNDBOARD_VOLUME = 15
 
-    def __init__(self) -> None:
+    def __init__(self, launched_from_startup: bool = False) -> None:
         super().__init__()
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setWindowTitle("SoundboardEZ")
         self.resize(920, 520)
         self.setMinimumSize(920, 520)
+
+        self._launched_from_startup = bool(launched_from_startup)
+        self._app_state: AppState = load_app_state()
+        if self._app_state.startupEnabled and not is_startup_enabled():
+            # Keep UI state aligned with actual registration state.
+            self._app_state.startupEnabled = False
+            save_app_state(self._app_state)
+        self._initial_soundboard_enabled = self._determine_initial_soundboard_enabled()
 
         self.sounds_dir = Path("sounds")
         self._local_all_items: list[str] = []
@@ -989,22 +1235,70 @@ class SoundboardWindow(QMainWindow):
         self._trim_play_timer.setInterval(80)
         self._trim_play_timer.timeout.connect(self._sync_trim_playhead)
         self._ui_animations: list[QPropertyAnimation] = []
+        self._volume_state = RuntimeVolumeState()
+        self._preview_player = ManagedOutputPlayer(gain=self._volume_state.preview_gain)
+        self._speaker_player = ManagedOutputPlayer(gain=self._volume_state.speaker_gain)
+        self._aux_output_device_cache: int | None = None
+        self._aux_output_cache_deadline = 0.0
         self._soundboard_initialized = False
+        self._engine_started_event = threading.Event()
+        self._engine_start_error: str | None = None
+        self._tray_icon: QSystemTrayIcon | None = None
+        self._tray_menu: QMenu | None = None
+        self._tray_startup_action: QAction | None = None
+        self._tray_start_soundboard_action: QAction | None = None
+        self._tray_soundboard_power_action: QAction | None = None
+        self._tray_notifications_action: QAction | None = None
+        self._tray_open_action: QAction | None = None
+        self._tray_quit_action: QAction | None = None
+        self._quitting = False
+        self._tray_hide_hint_shown = False
+        self._window_corner_radius = 20
+        self._window_dragging = False
+        self._window_drag_offset = QPoint()
+        self._window_drag_widgets: list[QObject] = []
+        self._resize_margin = 8
+        self._resize_edges = Qt.Edge(0)
+        self._resize_origin = QPoint()
+        self._resize_start_geometry = QRect()
+        self._button_motion_filter: ButtonMotionFilter | None = None
+        self._shell_shadow: QGraphicsDropShadowEffect | None = None
 
         self.engine = AudioEngine(
             samplerate=48000,
-            blocksize=512,
+            blocksize=0,
             input_channels=1,
             output_channels=1,
             sounds_dir=str(self.sounds_dir),
         )
+        self.engine.soundboard.clear_hotkeys()
+        self.engine.set_mic_input_gain(self.DEFAULT_MIC_VOLUME / 100.0)
+        self.engine.soundboard.set_volume(self.DEFAULT_SOUNDBOARD_VOLUME / 100.0)
+        self.engine.set_noise_suppression_enabled(True)
+        self.engine.set_soundboard_enabled(self._initial_soundboard_enabled)
         self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
         self._engine_thread.start()
 
         central = QWidget()
-        central.setObjectName("Root")
+        central.setObjectName("WindowBackdrop")
         self.setCentralWidget(central)
-        root_layout = QHBoxLayout(central)
+        shell_layout = QVBoxLayout(central)
+        shell_layout.setContentsMargins(10, 10, 10, 10)
+        shell_layout.setSpacing(0)
+
+        self.window_shell = QFrame()
+        self.window_shell.setObjectName("Root")
+        self.window_shell.setMouseTracking(True)
+        shell_layout.addWidget(self.window_shell, 1)
+
+        shadow = QGraphicsDropShadowEffect(self.window_shell)
+        shadow.setBlurRadius(34.0)
+        shadow.setOffset(0.0, 12.0)
+        shadow.setColor(QColor(4, 12, 27, 165))
+        self.window_shell.setGraphicsEffect(shadow)
+        self._shell_shadow = shadow
+
+        root_layout = QHBoxLayout(self.window_shell)
         root_layout.setContentsMargins(16, 16, 16, 16)
         root_layout.setSpacing(16)
 
@@ -1028,7 +1322,7 @@ class SoundboardWindow(QMainWindow):
         title_col.setSpacing(0)
         self.app_title = QLabel("SoundboardEZ")
         self.app_title.setObjectName("AppTitle")
-        self.app_subtitle = QLabel("Virtual Mic Mixer")
+        self.app_subtitle = QLabel("Easy Remote+Native Soundboard")
         self.app_subtitle.setObjectName("AppSubtitle")
         title_col.addWidget(self.app_title)
         title_col.addWidget(self.app_subtitle)
@@ -1038,9 +1332,27 @@ class SoundboardWindow(QMainWindow):
         self.route_status_label.setObjectName("RoutePill")
         self.route_status_label.setMinimumWidth(0)
         self.route_status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.window_controls = QWidget()
+        self.window_controls.setObjectName("WindowControls")
+        controls_row = QHBoxLayout(self.window_controls)
+        controls_row.setContentsMargins(0, 0, 0, 0)
+        controls_row.setSpacing(8)
+        self.title_min_btn = MacTrafficButton("minimize")
+        self.title_min_btn.setObjectName("TitleMinBtn")
+        self.title_min_btn.setToolTip("Minimize")
+        self.title_close_btn = MacTrafficButton("close")
+        self.title_close_btn.setObjectName("TitleCloseBtn")
+        self.title_close_btn.setToolTip("Close")
+        for btn in (self.title_min_btn, self.title_close_btn):
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setCheckable(False)
+            controls_row.addWidget(btn)
+        self.title_min_btn.clicked.connect(self.showMinimized)
+        self.title_close_btn.clicked.connect(self._on_title_close_clicked)
         state_col = QVBoxLayout()
         state_col.setContentsMargins(0, 0, 0, 0)
-        state_col.setSpacing(8)
+        state_col.setSpacing(7)
+        state_col.addWidget(self.window_controls, 0, Qt.AlignmentFlag.AlignRight)
         state_col.addWidget(self.status_label, 0, Qt.AlignmentFlag.AlignRight)
         state_col.addWidget(self.route_status_label, 0, Qt.AlignmentFlag.AlignRight)
         top_layout.addWidget(self.app_logo)
@@ -1070,10 +1382,11 @@ class SoundboardWindow(QMainWindow):
         self.importer_title_label = QLabel("Importer Workspace")
         self.importer_title_label.setObjectName("SectionTitle")
         self.import_search_input = QLineEdit()
-        self.import_search_input.setPlaceholderText("Search myinstants sounds")
+        self.import_search_input.setPlaceholderText("Search sounds by name")
         self.import_search_input.setClearButtonEnabled(True)
-        self.import_search_btn = QPushButton("Search")
-        self.import_search_btn.setProperty("variant", "primary")
+        self.import_search_input.setMinimumHeight(40)
+        self.import_search_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.import_search_input.setMinimumWidth(260)
         self.close_importer_btn = QPushButton("X")
         self.close_importer_btn.setObjectName("ImporterClose")
         self.close_importer_btn.setToolTip("Close importer")
@@ -1085,10 +1398,10 @@ class SoundboardWindow(QMainWindow):
         self.preview_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.preview_volume_slider.setRange(0, 100)
         self.preview_volume_slider.setValue(8)
-        self.mic_volume_label = QLabel("Mic Volume: 50%")
+        self.mic_volume_label = QLabel(f"Mic Volume: {self.DEFAULT_MIC_VOLUME}%")
         self.mic_volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.mic_volume_slider.setRange(0, 100)
-        self.mic_volume_slider.setValue(50)
+        self.mic_volume_slider.setRange(0, 200)
+        self.mic_volume_slider.setValue(self.DEFAULT_MIC_VOLUME)
         self.remote_feed_list = SmoothListWidget(slow_factor=0.5)
         self.remote_feed_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.remote_feed_list.setSpacing(16)
@@ -1105,7 +1418,6 @@ class SoundboardWindow(QMainWindow):
         importer_search_row.setContentsMargins(0, 0, 0, 0)
         importer_search_row.setSpacing(12)
         importer_search_row.addWidget(self.import_search_input, 1)
-        importer_search_row.addWidget(self.import_search_btn)
 
         importer_actions_row = QHBoxLayout()
         importer_actions_row.setContentsMargins(0, 0, 0, 0)
@@ -1121,17 +1433,10 @@ class SoundboardWindow(QMainWindow):
         importer_preview_row.addWidget(self.preview_volume_label)
         importer_preview_row.addWidget(self.preview_volume_slider, 1)
 
-        importer_mic_row = QHBoxLayout()
-        importer_mic_row.setContentsMargins(0, 0, 0, 0)
-        importer_mic_row.setSpacing(16)
-        importer_mic_row.addWidget(self.mic_volume_label)
-        importer_mic_row.addWidget(self.mic_volume_slider, 1)
-
         left_layout.addLayout(importer_header_row)
         left_layout.addLayout(importer_search_row)
         left_layout.addLayout(importer_actions_row)
         left_layout.addLayout(importer_preview_row)
-        left_layout.addLayout(importer_mic_row)
         importer_hint = QLabel("Click Play or Import on any sound. More loads as you scroll.")
         importer_hint.setObjectName("HintLabel")
         left_layout.addWidget(importer_hint)
@@ -1144,7 +1449,7 @@ class SoundboardWindow(QMainWindow):
         self.right_group.setObjectName("MainCard")
         self.right_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         right_layout = QVBoxLayout(self.right_group)
-        right_layout.setContentsMargins(16, 16, 16, 16)
+        right_layout.setContentsMargins(24, 24, 24, 24)
         right_layout.setSpacing(16)
         self.soundboard_sidebar = QWidget()
         self.soundboard_sidebar.setObjectName("SideCard")
@@ -1158,13 +1463,18 @@ class SoundboardWindow(QMainWindow):
         self.soundboard_main = QWidget()
         self.soundboard_main.setObjectName("SoundboardMain")
         self.soundboard_main.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        main_shadow = QGraphicsDropShadowEffect(self.soundboard_main)
+        main_shadow.setBlurRadius(25)
+        main_shadow.setOffset(0, 10)
+        main_shadow.setColor(QColor(0, 0, 0, 64))
+        self.soundboard_main.setGraphicsEffect(main_shadow)
         main_layout = QVBoxLayout(self.soundboard_main)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(16)
-        self.soundboard_volume_label = QLabel("Soundboard Volume: 100%")
+        self.soundboard_volume_label = QLabel(f"Soundboard Volume: {self.DEFAULT_SOUNDBOARD_VOLUME}%")
         self.soundboard_volume_slider = QSlider(Qt.Orientation.Horizontal)
         self.soundboard_volume_slider.setRange(0, 200)
-        self.soundboard_volume_slider.setValue(100)
+        self.soundboard_volume_slider.setValue(self.DEFAULT_SOUNDBOARD_VOLUME)
         self.speaker_monitor_btn = QPushButton("Play To Speaker: Off")
         self.speaker_monitor_btn.setProperty("variant", "primary")
         self.speaker_monitor_btn.setCheckable(True)
@@ -1188,7 +1498,7 @@ class SoundboardWindow(QMainWindow):
         self.refresh_devices_btn.setProperty("variant", "slate")
         self.apply_devices_btn = QPushButton("Apply Route")
         self.apply_devices_btn.setProperty("variant", "primary")
-        self.mic_noise_suppression_btn = QPushButton("Mic Noise Suppression: Off")
+        self.mic_noise_suppression_btn = QPushButton("Mic Noise Suppression: On")
         self.mic_noise_suppression_btn.setProperty("variant", "secondary")
         self.mic_noise_suppression_btn.setCheckable(True)
         self.play_local_btn = QPushButton("Play Selected")
@@ -1206,7 +1516,10 @@ class SoundboardWindow(QMainWindow):
         self.refresh_local_btn = QPushButton("Refresh Local")
         self.refresh_local_btn.setProperty("variant", "slate")
         self.local_search_input = QLineEdit()
+        self.local_search_input.setObjectName("LocalSearchInput")
         self.local_search_input.setPlaceholderText("Search imported sounds")
+        self.local_search_input.setFixedHeight(36)
+        self.local_search_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.local_list = SmoothListWidget(slow_factor=0.6)
         self.local_list.setObjectName("LocalSoundGrid")
         self.local_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -1217,13 +1530,21 @@ class SoundboardWindow(QMainWindow):
         self.local_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.local_list.setMovement(QListView.Movement.Static)
         self.local_list.setUniformItemSizes(True)
-        self.local_list.setSpacing(24)
+        self.local_list.setSpacing(12)
+        self.local_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.local_list.setWordWrap(True)
         self.local_list.setSelectionRectVisible(False)
         self.local_list.setMouseTracking(True)
+        self.local_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.local_list.customContextMenuRequested.connect(self._show_local_context_menu)
         self.local_list.setItemDelegate(LocalTileDelegate(self.local_list))
         self.local_title = QLabel("Imported Sounds")
         self.local_title.setObjectName("SectionTitle")
+        title_font = QFont(self.local_title.font())
+        title_font.setPointSize(22)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        title_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, -0.3)
+        self.local_title.setFont(title_font)
         self._local_tile_colors: dict[str, tuple[str, str]] = {}
         self.delete_mode_hint = QLabel("Delete mode: tick sounds, then click Delete Checked")
         self.delete_mode_hint.setObjectName("HintLabel")
@@ -1277,6 +1598,8 @@ class SoundboardWindow(QMainWindow):
         volume_section_layout.setSpacing(8)
         volume_section_layout.addWidget(self.soundboard_volume_label)
         volume_section_layout.addWidget(self.soundboard_volume_slider)
+        volume_section_layout.addWidget(self.mic_volume_label)
+        volume_section_layout.addWidget(self.mic_volume_slider)
 
         speaker_section_layout = QVBoxLayout()
         speaker_section_layout.setContentsMargins(0, 0, 0, 0)
@@ -1325,22 +1648,41 @@ class SoundboardWindow(QMainWindow):
         self.sidebar_scroll.setWidgetResizable(True)
         self.sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.sidebar_scroll.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
-        self.sidebar_scroll.setMinimumWidth(sidebar_w + 10)
-        self.sidebar_scroll.setMaximumWidth(sidebar_w + 10)
+        self.sidebar_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.sidebar_scroll.setWidget(self.soundboard_sidebar)
+        self.sidebar_scroll.verticalScrollBar().setSingleStep(14)
 
-        local_header = QHBoxLayout()
-        local_header.setSpacing(16)
-        local_header.addWidget(self.local_title)
-        local_header.addStretch(1)
-        local_header.addWidget(self.local_search_input, 0)
-        main_layout.addLayout(local_header)
-        main_layout.addWidget(self.local_list, 1)
+        self.sidebar_shell = QFrame()
+        self.sidebar_shell.setObjectName("SideCardShell")
+        self.sidebar_shell.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.sidebar_shell.setMinimumWidth(sidebar_w + 10)
+        self.sidebar_shell.setMaximumWidth(sidebar_w + 10)
+        sidebar_shell_layout = QVBoxLayout(self.sidebar_shell)
+        sidebar_shell_layout.setContentsMargins(1, 1, 1, 1)
+        sidebar_shell_layout.setSpacing(0)
+        sidebar_shell_layout.addWidget(self.sidebar_scroll)
+
+        local_header_shell = QFrame()
+        local_header_shell.setObjectName("LocalHeaderShell")
+        header_shell_layout = QHBoxLayout(local_header_shell)
+        header_shell_layout.setContentsMargins(14, 10, 14, 10)
+        header_shell_layout.setSpacing(14)
+        header_shell_layout.addWidget(self.local_title)
+        header_shell_layout.addStretch(1)
+        header_shell_layout.addWidget(self.local_search_input, 0)
+        main_layout.addWidget(local_header_shell)
+
+        self.local_list_shell = QFrame()
+        self.local_list_shell.setObjectName("LocalListShell")
+        shell_layout = QVBoxLayout(self.local_list_shell)
+        shell_layout.setContentsMargins(20, 20, 20, 20)
+        shell_layout.setSpacing(0)
+        shell_layout.addWidget(self.local_list)
+        main_layout.addWidget(self.local_list_shell, 1)
 
         right_layout.addWidget(self.soundboard_main, 1)
         main_column_layout.addWidget(self.right_group, 1)
-        root_layout.addWidget(self.sidebar_scroll)
+        root_layout.addWidget(self.sidebar_shell)
         root_layout.addWidget(self.main_content, 1)
 
         self.importer_window = FramelessImporterDialog(self)
@@ -1366,9 +1708,9 @@ class SoundboardWindow(QMainWindow):
         importer_window_layout.addWidget(self.importer_shell)
         self.importer_window.finished.connect(lambda _=0: self._set_importer_visible(False))
 
-        self.import_search_btn.clicked.connect(self.apply_import_search)
         self.close_importer_btn.clicked.connect(self.close_importer_panel)
         self.import_search_input.returnPressed.connect(self.apply_import_search)
+        self.import_search_input.textChanged.connect(lambda _=None: self.apply_import_search())
         self.fetch_btn.clicked.connect(self.fetch_sounds)
         self.preview_volume_slider.valueChanged.connect(self.update_preview_volume_label)
         self.mic_volume_slider.valueChanged.connect(self.update_mic_volume_label)
@@ -1401,6 +1743,8 @@ class SoundboardWindow(QMainWindow):
         self._apply_modern_theme()
         self._apply_button_ratios()
         self._apply_button_motion()
+        self._install_window_interaction_regions()
+        self._setup_desktop_notifications()
         self._importer_loaded_once = False
         self._set_importer_visible(False)
         self.refresh_audio_devices()
@@ -1409,22 +1753,30 @@ class SoundboardWindow(QMainWindow):
         self.update_mic_volume_label(self.mic_volume_slider.value())
         self.update_soundboard_volume(self.soundboard_volume_slider.value())
         self.update_speaker_monitor_volume_label(self.speaker_monitor_slider.value())
-        self.engine.set_noise_suppression_enabled(False)
+        self.engine.set_noise_suppression_enabled(True)
+        self._set_soundboard_enabled(self._initial_soundboard_enabled, persist=False, silent=True)
         self._sync_mic_noise_suppression_button()
+        self._sync_startup_tray_state()
         self._update_route_status()
+        self._apply_window_mask()
         self._run_entrance_animation()
 
     def _run_engine(self) -> None:
+        self._engine_start_error = None
+        self._engine_started_event.clear()
+
+        def _on_engine_started() -> None:
+            self._engine_started_event.set()
+
         try:
             if not self._soundboard_initialized:
-                mapping = self.engine.setup_soundboard(auto_hotkeys=True)
+                self.engine.setup_soundboard(auto_hotkeys=False)
+                self.engine.soundboard.clear_hotkeys()
                 self._soundboard_initialized = True
-                if mapping:
-                    print("Initial hotkeys:")
-                    for key, name in mapping.items():
-                        print(f"  {key} -> {name}")
-            self.engine.start()
+            self.engine.start(on_started=_on_engine_started)
         except Exception as exc:
+            self._engine_start_error = str(exc)
+            self._engine_started_event.set()
             print(f"Audio engine error: {exc}")
 
     @staticmethod
@@ -1448,6 +1800,7 @@ class SoundboardWindow(QMainWindow):
         self.route_status_label.setText(f"Hosted On: {out_name} | Mic: {in_name}")
 
     def refresh_audio_devices(self) -> None:
+        self._aux_output_cache_deadline = 0.0
         current_in = self._coerce_device_data(self.mic_device_combo.currentData())
         current_out = self._coerce_device_data(self.output_device_combo.currentData())
 
@@ -1479,24 +1832,71 @@ class SoundboardWindow(QMainWindow):
         self.status_label.setText("Audio devices refreshed.")
         self._update_route_status()
 
-    def _restart_audio_engine(self) -> None:
+    def _restart_audio_engine(self, start_timeout: float = 4.0) -> tuple[bool, str | None]:
         self.engine.stop()
         if self._engine_thread.is_alive():
-            self._engine_thread.join(timeout=2.5)
+            self._engine_thread.join(timeout=5.0)
+        if self._engine_thread.is_alive():
+            return False, "Previous audio engine thread did not stop."
+
+        self._engine_start_error = None
+        self._engine_started_event.clear()
         self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
         self._engine_thread.start()
+        deadline = time.monotonic() + max(0.2, float(start_timeout))
+        while time.monotonic() < deadline:
+            if self._engine_started_event.wait(timeout=0.05):
+                break
+            if not self._engine_thread.is_alive():
+                break
+
+        if self._engine_start_error:
+            return False, self._engine_start_error
+        if self._engine_started_event.is_set():
+            return True, None
+        if not self._engine_thread.is_alive():
+            return False, "Audio engine thread exited before startup."
+        return False, "Audio engine start timed out."
 
     def apply_audio_route(self) -> None:
         in_dev = self._coerce_device_data(self.mic_device_combo.currentData())
         out_dev = self._coerce_device_data(self.output_device_combo.currentData())
+        old_in = self.engine.input_device
+        old_out = self.engine.output_device
+
+        if in_dev == old_in and out_dev == old_out:
+            self.status_label.setText("Audio route unchanged.")
+            self._update_route_status()
+            return
+
+        self.stop_remote_preview(silent=True)
+        self._speaker_player.stop()
         self.engine.input_device = in_dev
         self.engine.output_device = out_dev
-        try:
-            self._restart_audio_engine()
-            self.status_label.setText("Audio route applied.")
+        ok, err = self._restart_audio_engine()
+        if ok:
+            self._aux_output_cache_deadline = 0.0
+            msg = "Audio route applied."
+            self.status_label.setText(msg)
+            self._notify_desktop(msg, title="Audio Route")
             self._update_route_status()
-        except Exception as exc:
-            self.status_label.setText(f"Failed to apply route: {exc}")
+            return
+
+        self.engine.input_device = old_in
+        self.engine.output_device = old_out
+        rollback_ok, rollback_err = self._restart_audio_engine()
+        if rollback_ok:
+            self._aux_output_cache_deadline = 0.0
+            msg = f"Route failed ({err}). Reverted to previous route."
+            self.status_label.setText(msg)
+            self._notify_desktop(msg, title="Audio Route", error=True)
+            self._update_route_status()
+            return
+
+        msg = f"Route failed ({err}). Restore failed ({rollback_err})."
+        self.status_label.setText(msg)
+        self._notify_desktop(msg, title="Audio Route", error=True)
+        self._update_route_status()
 
     def _apply_button_ratios(self) -> None:
         sidebar_buttons = [
@@ -1519,7 +1919,6 @@ class SoundboardWindow(QMainWindow):
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         importer_buttons = [
-            self.import_search_btn,
             self.fetch_btn,
             self.import_file_btn,
         ]
@@ -1534,7 +1933,8 @@ class SoundboardWindow(QMainWindow):
         self.local_search_input.setMinimumWidth(220)
         self.import_search_input.setMinimumHeight(46)
         self.preview_volume_slider.setMinimumWidth(220)
-        self.mic_volume_slider.setMinimumWidth(220)
+        self.mic_volume_slider.setMinimumWidth(0)
+        self.mic_volume_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.mic_device_combo.setMinimumHeight(32)
         self.mic_device_combo.setMinimumWidth(0)
         self.mic_device_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -1545,12 +1945,17 @@ class SoundboardWindow(QMainWindow):
     def _apply_modern_theme(self) -> None:
         self.setStyleSheet(
             """
-            QWidget#Root {
+            QWidget#WindowBackdrop {
+                background: transparent;
+            }
+            QFrame#Root {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 #0a111d,
-                    stop:1 #0f1b2f);
+                    stop:0 #111f33,
+                    stop:1 #152a44);
+                border: 1px solid rgba(157, 179, 208, 44);
+                border-radius: 22px;
                 color: #e7edf7;
-                font-family: "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", sans-serif;
+                font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", sans-serif;
                 font-size: 13px;
             }
             QWidget#MainContent {
@@ -1561,14 +1966,26 @@ class SoundboardWindow(QMainWindow):
                 border: none;
             }
             QWidget#ImporterShell {
-                background: rgba(16, 25, 39, 238);
-                border: 1px solid rgba(148, 163, 184, 38);
+                background: rgba(19, 33, 52, 236);
+                border: 1px solid rgba(168, 187, 214, 34);
                 border-radius: 28px;
             }
             QFrame#TopBar {
-                background: rgba(37, 53, 74, 210);
-                border: 1px solid rgba(148, 163, 184, 36);
+                background: rgba(49, 70, 97, 210);
+                border: 1px solid rgba(162, 183, 209, 40);
                 border-radius: 20px;
+            }
+            QWidget#WindowControls {
+                background: transparent;
+            }
+            QPushButton#TitleMinBtn, QPushButton#TitleCloseBtn {
+                min-width: 16px;
+                max-width: 16px;
+                min-height: 16px;
+                max-height: 16px;
+                padding: 0px;
+                border: none;
+                background: transparent;
             }
             QLabel#LogoBadge {
                 min-width: 32px;
@@ -1576,8 +1993,8 @@ class SoundboardWindow(QMainWindow):
                 min-height: 32px;
                 max-height: 32px;
                 border-radius: 16px;
-                background: rgba(12, 20, 34, 188);
-                border: 1px solid #7dd3fc;
+                background: rgba(16, 27, 45, 196);
+                border: 1px solid #8ad8ff;
                 color: #e7edf7;
                 font-size: 12px;
                 font-weight: 650;
@@ -1589,13 +2006,13 @@ class SoundboardWindow(QMainWindow):
                 letter-spacing: 0.2px;
             }
             QLabel#AppSubtitle {
-                color: #9eb2cc;
+                color: #aac2df;
                 font-size: 15px;
                 font-weight: 500;
             }
             QGroupBox#MainCard {
-                background: rgba(30, 42, 60, 205);
-                border: 1px solid rgba(148, 163, 184, 32);
+                background: rgba(38, 55, 78, 214);
+                border: 1px solid rgba(170, 191, 217, 20);
                 border-radius: 22px;
                 margin-top: 18px;
                 padding-top: 14px;
@@ -1622,10 +2039,15 @@ class SoundboardWindow(QMainWindow):
                 height: 0px;
                 padding: 0px;
             }
-            QWidget#SideCard {
-                background: rgba(40, 56, 78, 176);
-                border: 1px solid rgba(148, 163, 184, 30);
+            QFrame#SideCardShell {
+                background: rgba(47, 66, 92, 182);
+                border: 1px solid rgba(164, 185, 212, 32);
                 border-radius: 20px;
+            }
+            QWidget#SideCard {
+                background: transparent;
+                border: none;
+                border-radius: 0px;
             }
             QScrollArea#SideScroll {
                 background: transparent;
@@ -1644,16 +2066,16 @@ class SoundboardWindow(QMainWindow):
                 border: none;
             }
             QWidget#SoundboardMain {
-                background: rgba(31, 46, 67, 186);
-                border: 1px solid rgba(148, 163, 184, 30);
+                background: rgba(51, 72, 99, 226);
+                border: 1px solid rgba(166, 186, 211, 16);
                 border-radius: 20px;
-                padding: 10px;
+                padding: 24px;
             }
             QLabel#SectionTitle {
                 font-size: 22px;
                 font-weight: 600;
                 color: #edf3fb;
-                letter-spacing: 0.2px;
+                letter-spacing: -0.3px;
             }
             QLabel {
                 color: #e7edf7;
@@ -1694,12 +2116,16 @@ class SoundboardWindow(QMainWindow):
                 border: 1px solid rgba(148, 163, 184, 44);
                 border-radius: 15px;
                 padding: 10px 13px;
-                selection-background-color: #45c8ff;
+                selection-background-color: #59d7ff;
                 color: #e7edf7;
                 font-size: 14px;
             }
+            QLineEdit#LocalSearchInput {
+                color: rgba(231, 237, 247, 204);
+                font-size: 14px;
+            }
             QLineEdit:focus {
-                border: 1px solid #62d6ff;
+                border: 1px solid #6be0ff;
                 background: rgba(10, 24, 43, 245);
             }
             QComboBox#RouteCombo {
@@ -1726,22 +2152,22 @@ class SoundboardWindow(QMainWindow):
                 border: 1px solid rgba(148, 163, 184, 52);
                 padding: 6px 14px;
                 min-height: 30px;
-                background: rgba(62, 79, 104, 220);
+                background: rgba(70, 90, 118, 224);
                 color: #eaf2fb;
                 font-weight: 600;
                 font-size: 14px;
             }
             QPushButton:hover {
-                background: rgba(76, 97, 126, 230);
-                border-color: rgba(96, 214, 255, 190);
+                background: rgba(84, 108, 138, 232);
+                border-color: rgba(107, 224, 255, 196);
             }
             QPushButton:pressed {
-                background: rgba(56, 74, 98, 235);
+                background: rgba(60, 80, 104, 238);
             }
             QPushButton:checked,
             QPushButton[active="true"] {
-                background: #0f6f98;
-                border-color: #62d6ff;
+                background: #1084b7;
+                border-color: #74e1ff;
                 color: #f7fbff;
             }
             QPushButton[variant="danger"] {
@@ -1775,19 +2201,49 @@ class SoundboardWindow(QMainWindow):
                 padding: 10px;
                 outline: none;
             }
-            QListWidget#LocalSoundGrid {
-                background: rgba(14, 26, 45, 226);
-                border: 1px solid rgba(148, 163, 184, 36);
+            QFrame#LocalListShell {
+                background: rgba(16, 24, 36, 210);
+                border: 1px solid rgba(255, 255, 255, 16);
+                border-radius: 20px;
+            }
+            QFrame#LocalHeaderShell {
+                background: rgba(240, 244, 248, 32);
+                border: 1px solid rgba(255, 255, 255, 26);
                 border-radius: 18px;
-                padding: 10px;
+            }
+            QListWidget#LocalSoundGrid {
+                background: rgba(18, 26, 38, 196);
+                border: 1px solid rgba(255, 255, 255, 18);
+                border-radius: 16px;
+                padding: 12px;
+            }
+            QListWidget#LocalSoundGrid:hover {
+                border-color: rgba(255, 255, 255, 30);
             }
             QListWidget#LocalSoundGrid::item {
                 border: none;
-                color: #edf4fc;
+                color: #f2f7ff;
+                border-radius: 14px;
             }
             QListWidget#LocalSoundGrid::item:selected {
                 background: transparent;
-                color: #edf4fc;
+                color: #ffffff;
+            }
+            QMenu#LocalTileMenu {
+                background: rgba(18, 26, 38, 230);
+                border: 1px solid rgba(148, 163, 184, 40);
+                border-radius: 10px;
+                padding: 6px 8px;
+            }
+            QMenu#LocalTileMenu::item {
+                color: #eaf2fb;
+                padding: 6px 10px;
+                border-radius: 8px;
+                min-width: 140px;
+            }
+            QMenu#LocalTileMenu::item:selected {
+                background: rgba(80, 130, 200, 170);
+                color: #ffffff;
             }
             QListWidget::item {
                 border-radius: 12px;
@@ -1805,7 +2261,7 @@ class SoundboardWindow(QMainWindow):
             }
             QSlider::sub-page:horizontal {
                 border-radius: 6px;
-                background: #45c8ff;
+                background: #59d7ff;
             }
             QSlider::handle:horizontal {
                 background: #dbe7f6;
@@ -1832,13 +2288,234 @@ class SoundboardWindow(QMainWindow):
         )
 
     def _apply_button_motion(self) -> None:
-        # Keep interaction light-weight in the minimal theme.
+        # Title traffic-light buttons render/animate themselves.
         return
+
+    def _install_window_interaction_regions(self) -> None:
+        drag_widgets = [
+            self.top_bar,
+            self.app_logo,
+            self.app_title,
+            self.app_subtitle,
+            self.status_label,
+            self.route_status_label,
+            self.window_controls,
+        ]
+        for widget in drag_widgets:
+            if widget in self._window_drag_widgets:
+                continue
+            self._window_drag_widgets.append(widget)
+            widget.installEventFilter(self)
+        self.window_shell.installEventFilter(self)
+
+    @staticmethod
+    def _is_drag_exempt_widget(widget: QWidget | None) -> bool:
+        current = widget
+        while current is not None:
+            if isinstance(
+                current,
+                (QPushButton, QLineEdit, QComboBox, QSlider, QListWidget, QAbstractItemView, QScrollArea),
+            ):
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _hit_test_resize_edges(self, pos: QPoint) -> Qt.Edge:
+        if self.isMaximized():
+            return Qt.Edge(0)
+        rect = self.window_shell.rect()
+        margin = max(4, int(self._resize_margin))
+        if rect.width() < (margin * 2) or rect.height() < (margin * 2):
+            return Qt.Edge(0)
+
+        edges = Qt.Edge(0)
+        if pos.x() <= margin:
+            edges |= Qt.Edge.LeftEdge
+        elif pos.x() >= rect.width() - margin:
+            edges |= Qt.Edge.RightEdge
+
+        if pos.y() <= margin:
+            edges |= Qt.Edge.TopEdge
+        elif pos.y() >= rect.height() - margin:
+            edges |= Qt.Edge.BottomEdge
+        return edges
+
+    @staticmethod
+    def _cursor_for_edges(edges: Qt.Edge) -> Qt.CursorShape:
+        if edges == Qt.Edge(0):
+            return Qt.CursorShape.ArrowCursor
+        has_left = bool(edges & Qt.Edge.LeftEdge)
+        has_right = bool(edges & Qt.Edge.RightEdge)
+        has_top = bool(edges & Qt.Edge.TopEdge)
+        has_bottom = bool(edges & Qt.Edge.BottomEdge)
+        if (has_left and has_top) or (has_right and has_bottom):
+            return Qt.CursorShape.SizeFDiagCursor
+        if (has_right and has_top) or (has_left and has_bottom):
+            return Qt.CursorShape.SizeBDiagCursor
+        if has_left or has_right:
+            return Qt.CursorShape.SizeHorCursor
+        return Qt.CursorShape.SizeVerCursor
+
+    def _resize_from_edges(self, global_pos: QPoint) -> None:
+        if self._resize_edges == Qt.Edge(0):
+            return
+        delta = global_pos - self._resize_origin
+        geo = QRect(self._resize_start_geometry)
+
+        if self._resize_edges & Qt.Edge.LeftEdge:
+            geo.setLeft(geo.left() + delta.x())
+        if self._resize_edges & Qt.Edge.RightEdge:
+            geo.setRight(geo.right() + delta.x())
+        if self._resize_edges & Qt.Edge.TopEdge:
+            geo.setTop(geo.top() + delta.y())
+        if self._resize_edges & Qt.Edge.BottomEdge:
+            geo.setBottom(geo.bottom() + delta.y())
+
+        min_w = max(1, self.minimumWidth())
+        min_h = max(1, self.minimumHeight())
+
+        if geo.width() < min_w:
+            if self._resize_edges & Qt.Edge.LeftEdge:
+                geo.setLeft(geo.right() - min_w + 1)
+            else:
+                geo.setRight(geo.left() + min_w - 1)
+        if geo.height() < min_h:
+            if self._resize_edges & Qt.Edge.TopEdge:
+                geo.setTop(geo.bottom() - min_h + 1)
+            else:
+                geo.setBottom(geo.top() + min_h - 1)
+        self.setGeometry(geo)
+
+    def _build_squircle_path(self, rect: QRectF, radius: float) -> QPainterPath:
+        r = max(0.0, min(float(radius), rect.width() * 0.5, rect.height() * 0.5))
+        c = r * 0.42
+        path = QPainterPath()
+        path.moveTo(rect.left() + r, rect.top())
+        path.lineTo(rect.right() - r, rect.top())
+        path.cubicTo(
+            rect.right() - c,
+            rect.top(),
+            rect.right(),
+            rect.top() + c,
+            rect.right(),
+            rect.top() + r,
+        )
+        path.lineTo(rect.right(), rect.bottom() - r)
+        path.cubicTo(
+            rect.right(),
+            rect.bottom() - c,
+            rect.right() - c,
+            rect.bottom(),
+            rect.right() - r,
+            rect.bottom(),
+        )
+        path.lineTo(rect.left() + r, rect.bottom())
+        path.cubicTo(
+            rect.left() + c,
+            rect.bottom(),
+            rect.left(),
+            rect.bottom() - c,
+            rect.left(),
+            rect.bottom() - r,
+        )
+        path.lineTo(rect.left(), rect.top() + r)
+        path.cubicTo(
+            rect.left(),
+            rect.top() + c,
+            rect.left() + c,
+            rect.top(),
+            rect.left() + r,
+            rect.top(),
+        )
+        path.closeSubpath()
+        return path
+
+    def _apply_window_mask(self) -> None:
+        if not hasattr(self, "window_shell"):
+            return
+        if self.isMaximized():
+            self.window_shell.clearMask()
+            return
+        # On some Windows DPI scale factors, widget masks clip in physical-pixel
+        # coordinates and can truncate the visible window. Keep rounded shell
+        # styling and skip explicit masking in that mode.
+        if self.devicePixelRatioF() > 1.01:
+            self.window_shell.clearMask()
+            return
+        rect = QRectF(self.window_shell.rect())
+        if rect.width() <= 2 or rect.height() <= 2:
+            return
+        path = self._build_squircle_path(rect.adjusted(0.5, 0.5, -0.5, -0.5), self._window_corner_radius)
+        region = QRegion(path.toFillPolygon().toPolygon())
+        self.window_shell.setMask(region)
+
+    def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
+        if obj is self.window_shell:
+            typ = event.type()
+            if typ == QEvent.Type.MouseMove:
+                if self._resize_edges != Qt.Edge(0) and (event.buttons() & Qt.MouseButton.LeftButton):
+                    self._resize_from_edges(event.globalPosition().toPoint())
+                    return True
+                if self._window_dragging and (event.buttons() & Qt.MouseButton.LeftButton):
+                    self.move(event.globalPosition().toPoint() - self._window_drag_offset)
+                    return True
+                edges = self._hit_test_resize_edges(event.position().toPoint())
+                self.window_shell.setCursor(self._cursor_for_edges(edges))
+            elif typ == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    edges = self._hit_test_resize_edges(event.position().toPoint())
+                    if edges != Qt.Edge(0):
+                        self._resize_edges = edges
+                        self._resize_origin = event.globalPosition().toPoint()
+                        self._resize_start_geometry = self.geometry()
+                        return True
+                    if not self.isMaximized():
+                        global_pos = event.globalPosition().toPoint()
+                        local_pos = self.mapFromGlobal(global_pos)
+                        child = self.childAt(local_pos)
+                        if not self._is_drag_exempt_widget(child):
+                            self._window_dragging = True
+                            self._window_drag_offset = global_pos - self.frameGeometry().topLeft()
+                            return True
+            elif typ == QEvent.Type.MouseButtonRelease:
+                if self._resize_edges != Qt.Edge(0):
+                    self._resize_edges = Qt.Edge(0)
+                    self.window_shell.setCursor(Qt.CursorShape.ArrowCursor)
+                    return True
+                if self._window_dragging:
+                    self._window_dragging = False
+                    self.window_shell.setCursor(Qt.CursorShape.ArrowCursor)
+                    return True
+            elif typ == QEvent.Type.Leave and self._resize_edges == Qt.Edge(0):
+                if not self._window_dragging:
+                    self.window_shell.setCursor(Qt.CursorShape.ArrowCursor)
+
+        if obj in self._window_drag_widgets:
+            typ = event.type()
+            if typ == QEvent.Type.MouseButtonPress:
+                if event.button() != Qt.MouseButton.LeftButton or self.isMaximized():
+                    return super().eventFilter(obj, event)
+                global_pos = event.globalPosition().toPoint()
+                local_pos = self.mapFromGlobal(global_pos)
+                child = self.childAt(local_pos)
+                if self._is_drag_exempt_widget(child):
+                    return super().eventFilter(obj, event)
+                self._window_dragging = True
+                self._window_drag_offset = global_pos - self.frameGeometry().topLeft()
+                return True
+            if typ == QEvent.Type.MouseMove and self._window_dragging and (event.buttons() & Qt.MouseButton.LeftButton):
+                self.move(event.globalPosition().toPoint() - self._window_drag_offset)
+                return True
+            if typ == QEvent.Type.MouseButtonRelease and self._window_dragging:
+                self._window_dragging = False
+                return True
+
+        return super().eventFilter(obj, event)
 
     def _run_entrance_animation(self) -> None:
         sequence = [
             (self.top_bar, 0),
-            (self.sidebar_scroll, 70),
+            (self.sidebar_shell, 70),
             (self.right_group, 120),
         ]
         for widget, start_ms in sequence:
@@ -1855,12 +2532,293 @@ class SoundboardWindow(QMainWindow):
             self._ui_animations.append(anim)
             QTimer.singleShot(start_ms, anim.start)
 
+    def _determine_initial_soundboard_enabled(self) -> bool:
+        if self._launched_from_startup and self._app_state.startupEnabled:
+            return bool(self._app_state.startSoundboardOnLaunch)
+        return bool(self._app_state.soundboardEnabled)
+
+    def _persist_app_state(self) -> None:
+        self._app_state.soundboardEnabled = bool(self.engine.is_soundboard_enabled())
+        save_app_state(self._app_state)
+
+    @staticmethod
+    def _set_action_checked(action: QAction | None, checked: bool) -> None:
+        if action is None:
+            return
+        was_blocked = action.blockSignals(True)
+        action.setChecked(bool(checked))
+        action.blockSignals(was_blocked)
+
+    def _set_soundboard_enabled(self, enabled: bool, persist: bool = True, silent: bool = False) -> bool:
+        active = bool(self.engine.set_soundboard_enabled(enabled))
+        self._set_action_checked(self._tray_soundboard_power_action, active)
+        self._app_state.soundboardEnabled = active
+        if persist:
+            save_app_state(self._app_state)
+        if not active:
+            self._speaker_player.stop()
+        if not silent:
+            self.status_label.setText("Soundboard enabled." if active else "Soundboard disabled (mic only).")
+        return active
+
+    def _sync_startup_tray_state(self) -> None:
+        startup_enabled = bool(self._app_state.startupEnabled)
+        self._set_action_checked(self._tray_startup_action, startup_enabled)
+        if self._tray_start_soundboard_action is not None:
+            self._tray_start_soundboard_action.setVisible(startup_enabled)
+            self._tray_start_soundboard_action.setEnabled(startup_enabled)
+            self._set_action_checked(
+                self._tray_start_soundboard_action,
+                bool(self._app_state.startSoundboardOnLaunch),
+            )
+        self._set_action_checked(self._tray_notifications_action, bool(self._app_state.allowNotifications))
+        self._set_action_checked(self._tray_soundboard_power_action, self.engine.is_soundboard_enabled())
+
+    def _toggle_start_with_windows(self, checked: bool) -> None:
+        target = bool(checked)
+        if target and not self._app_state.startupEnabled:
+            reply = QMessageBox.question(
+                self,
+                "Start With Windows",
+                "Allow SoundboardEZ to launch automatically when Windows starts?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self._set_action_checked(self._tray_startup_action, False)
+                self._sync_startup_tray_state()
+                return
+
+        ok, err = set_startup_enabled(target)
+        if not ok:
+            self._set_action_checked(self._tray_startup_action, self._app_state.startupEnabled)
+            self.status_label.setText(f"Startup update failed: {err}")
+            self._notify_desktop(self.status_label.text(), title="Startup", error=True)
+            self._sync_startup_tray_state()
+            return
+
+        self._app_state.startupEnabled = target
+        save_app_state(self._app_state)
+        self.status_label.setText("Start with Windows enabled." if target else "Start with Windows disabled.")
+        self._notify_desktop(self.status_label.text(), title="Startup")
+        self._sync_startup_tray_state()
+
+    def _toggle_start_soundboard_on_launch(self, checked: bool) -> None:
+        self._app_state.startSoundboardOnLaunch = bool(checked)
+        save_app_state(self._app_state)
+        self.status_label.setText(
+            "Startup soundboard mode: on." if checked else "Startup soundboard mode: off."
+        )
+
+    def _toggle_allow_notifications(self, checked: bool) -> None:
+        self._app_state.allowNotifications = bool(checked)
+        save_app_state(self._app_state)
+        self.status_label.setText("Desktop notifications enabled." if checked else "Desktop notifications disabled.")
+
+    def _toggle_soundboard_power(self, checked: bool) -> None:
+        self._set_soundboard_enabled(bool(checked), persist=True, silent=False)
+
+    def _restore_from_tray(self) -> None:
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _hide_to_tray(self, show_notice: bool = False) -> None:
+        self.hide()
+        if show_notice and not self._tray_hide_hint_shown:
+            self._tray_hide_hint_shown = True
+            self._notify_desktop("SoundboardEZ is still running in the system tray.")
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._restore_from_tray()
+
+    def _quit_from_tray(self) -> None:
+        self._quitting = True
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _on_title_close_clicked(self) -> None:
+        modifiers = QApplication.keyboardModifiers()
+        if bool(modifiers & Qt.KeyboardModifier.ShiftModifier):
+            self._quit_from_tray()
+            return
+        self.close()
+
+    def _setup_desktop_notifications(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_icon = None
+            return
+
+        try:
+            if self._tray_icon is not None:
+                return
+            tray = QSystemTrayIcon(self)
+            icon = self.windowIcon()
+            if icon.isNull():
+                style = self.style()
+                if style is not None:
+                    icon = style.standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            tray.setIcon(icon)
+            tray.setToolTip("SoundboardEZ")
+            tray.activated.connect(self._on_tray_activated)
+
+            menu = QMenu(self)
+            open_action = QAction("Open App", self)
+            open_action.triggered.connect(self._restore_from_tray)
+            menu.addAction(open_action)
+
+            menu.addSeparator()
+
+            startup_action = QAction("Start With Windows", self)
+            startup_action.setCheckable(True)
+            startup_action.toggled.connect(self._toggle_start_with_windows)
+            menu.addAction(startup_action)
+
+            startup_soundboard_action = QAction("Start Soundboard On Launch", self)
+            startup_soundboard_action.setCheckable(True)
+            startup_soundboard_action.toggled.connect(self._toggle_start_soundboard_on_launch)
+            menu.addAction(startup_soundboard_action)
+
+            notifications_action = QAction("Allow Notifications", self)
+            notifications_action.setCheckable(True)
+            notifications_action.toggled.connect(self._toggle_allow_notifications)
+            menu.addAction(notifications_action)
+
+            menu.addSeparator()
+
+            soundboard_power_action = QAction("Soundboard Enabled", self)
+            soundboard_power_action.setCheckable(True)
+            soundboard_power_action.toggled.connect(self._toggle_soundboard_power)
+            menu.addAction(soundboard_power_action)
+
+            menu.addSeparator()
+            quit_action = QAction("Quit", self)
+            quit_action.triggered.connect(self._quit_from_tray)
+            menu.addAction(quit_action)
+
+            tray.setContextMenu(menu)
+            tray.setVisible(True)
+            self._tray_icon = tray
+            self._tray_menu = menu
+            self._tray_open_action = open_action
+            self._tray_startup_action = startup_action
+            self._tray_start_soundboard_action = startup_soundboard_action
+            self._tray_notifications_action = notifications_action
+            self._tray_soundboard_power_action = soundboard_power_action
+            self._tray_quit_action = quit_action
+            self._sync_startup_tray_state()
+        except Exception:
+            self._tray_icon = None
+
+    def _notify_desktop(self, message: str, title: str = "SoundboardEZ", error: bool = False) -> None:
+        if not bool(self._app_state.allowNotifications):
+            return
+        text = " ".join(str(message).split()).strip()
+        if not text:
+            return
+        tray = self._tray_icon
+        if tray is None or not tray.isVisible():
+            return
+        icon = QSystemTrayIcon.MessageIcon.Critical if error else QSystemTrayIcon.MessageIcon.Information
+        try:
+            tray.showMessage(title, text, icon, 4200)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_virtual_cable_output_name(name: str) -> bool:
+        lowered = str(name).lower()
+        return (
+            "cable input" in lowered
+            or "vb-audio virtual cable" in lowered
+            or "virtual cable" in lowered
+        )
+
+    def _resolve_aux_output_device(self, force_refresh: bool = False) -> int | None:
+        now = time.monotonic()
+        if not force_refresh and now < self._aux_output_cache_deadline:
+            return self._aux_output_device_cache
+
+        default_out: int | None = None
+        try:
+            defaults = sd.default.device
+            if defaults is not None and len(defaults) > 1 and defaults[1] is not None:
+                candidate = int(defaults[1])
+                if candidate >= 0:
+                    default_out = candidate
+        except Exception:
+            default_out = None
+
+        if default_out is not None:
+            try:
+                dev = sd.query_devices(default_out)
+                if int(dev.get("max_output_channels", 0)) > 0:
+                    if not self._is_virtual_cable_output_name(str(dev.get("name", ""))):
+                        self._aux_output_device_cache = default_out
+                        self._aux_output_cache_deadline = now + 6.0
+                        return default_out
+            except Exception:
+                pass
+
+        candidates: list[tuple[int, int, int]] = []
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            devices = []
+        for idx, dev in enumerate(devices):
+            if int(dev.get("max_output_channels", 0)) <= 0:
+                continue
+            name = str(dev.get("name", ""))
+            if not name or self._is_virtual_cable_output_name(name):
+                continue
+            host_name = self.engine._hostapi_name(int(dev.get("hostapi", 0)))
+            host_priority = self.engine._hostapi_priority(host_name)
+            default_penalty = 0 if default_out is not None and idx == default_out else 1
+            candidates.append((default_penalty, host_priority, idx))
+
+        if not candidates:
+            self._aux_output_device_cache = None
+            self._aux_output_cache_deadline = now + 2.0
+            return None
+
+        candidates.sort()
+        chosen = int(candidates[0][2])
+        self._aux_output_device_cache = chosen
+        self._aux_output_cache_deadline = now + 6.0
+        return chosen
+
     def _run_worker(self, worker: QObject, on_finished, on_error) -> None:
         thread = QThread()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finished.connect(on_finished)
-        worker.error.connect(on_error)
+
+        def safe_finished(*args):
+            try:
+                on_finished(*args)
+            except Exception as exc:
+                self.status_label.setText("Operation failed unexpectedly.")
+                self._notify_desktop(str(exc), title="Worker Error", error=True)
+                print(f"Worker finished handler error: {exc}")
+
+        def safe_error(*args):
+            try:
+                on_error(*args)
+            except Exception as exc:
+                self.status_label.setText("Operation failed unexpectedly.")
+                self._notify_desktop(str(exc), title="Worker Error", error=True)
+                print(f"Worker error handler error: {exc}")
+
+        worker.finished.connect(safe_finished)
+        worker.error.connect(safe_error)
         worker.finished.connect(worker.deleteLater)
         worker.error.connect(worker.deleteLater)
         worker.finished.connect(thread.quit)
@@ -1906,11 +2864,11 @@ class SoundboardWindow(QMainWindow):
 
     def apply_import_search(self) -> None:
         raw = self.import_search_input.text().strip()
-        resolved, error = _resolve_myinstants_feed_url(raw)
-        if error or resolved is None:
-            self.status_label.setText(error or "Invalid search input.")
-            return
-        self.import_search_input.setText(resolved)
+        if not raw:
+            resolved = MYINSTANTS_INDEX_URL
+        else:
+            resolved = f"https://www.myinstants.com/en/search/?name={quote_plus(raw)}"
+        self._feed_url = resolved
         self.fetch_sounds()
 
     def import_from_link(self) -> None:
@@ -1996,6 +2954,7 @@ class SoundboardWindow(QMainWindow):
             return
 
         next_page = self._feed_page + 1
+        notify_completion = next_page == 1
         self._feed_loading = True
         self._fetch_in_progress = True
         self._fetch_timeout.start(20000)
@@ -2014,6 +2973,8 @@ class SoundboardWindow(QMainWindow):
                 else:
                     self.status_label.setText("Reached end of available sounds.")
                 self._feed_end_reached = True
+                if notify_completion:
+                    self._notify_desktop(self.status_label.text(), title="Feed Load")
                 return
 
             added = 0
@@ -2030,6 +2991,8 @@ class SoundboardWindow(QMainWindow):
                 self.status_label.setText("No new sounds on next page.")
             else:
                 self.status_label.setText(f"Loaded page {next_page} ({added} sounds). Scroll for more.")
+            if notify_completion:
+                self._notify_desktop(self.status_label.text(), title="Feed Load")
 
         def err(message: str) -> None:
             self._fetch_in_progress = False
@@ -2038,6 +3001,8 @@ class SoundboardWindow(QMainWindow):
             self.fetch_btn.setEnabled(True)
             friendly = self._friendly_fetch_error(message)
             self.status_label.setText(friendly)
+            if notify_completion:
+                self._notify_desktop(friendly, title="Feed Load", error=True)
             print(f"Feed load error: {message}")
 
         self._run_worker(worker, done, err)
@@ -2147,12 +3112,13 @@ class SoundboardWindow(QMainWindow):
         self.start_remote_preview(item)
 
     def start_remote_preview(self, item: RemoteSoundItem) -> None:
+        self._speaker_player.stop()
         self.stop_remote_preview(silent=True)
         self._preview_request_id += 1
         request_id = self._preview_request_id
         self._set_feed_play_button(item.url, "Loading...", enabled=False)
         self.status_label.setText(f"Loading '{item.name}'...")
-        worker = PreviewWorker(item, volume=self.preview_volume_slider.value() / 100.0)
+        worker = PreviewWorker(item, volume=self._volume_state.preview_gain)
 
         def done(payload: object) -> None:
             if request_id != self._preview_request_id:
@@ -2160,9 +3126,26 @@ class SoundboardWindow(QMainWindow):
             data = payload  # type: ignore[assignment]
             try:
                 remote_item = data["item"]
-                audio = data["audio"]
+                audio = np.array(data["audio"], dtype=np.float32, copy=True, order="C")
                 sr = data["sr"]
-                sd.play(audio, samplerate=sr, blocking=False)
+                if audio.ndim == 1:
+                    audio = audio.reshape(-1, 1)
+                elif audio.ndim > 2:
+                    audio = audio.reshape(audio.shape[0], -1)
+                audio = np.ascontiguousarray(audio, dtype=np.float32)
+                if audio.shape[0] == 0 or audio.shape[1] == 0:
+                    raise RuntimeError("Preview audio is empty.")
+
+                device = self._resolve_aux_output_device()
+                if device is None:
+                    raise RuntimeError("No non-virtual speaker output device is available for preview.")
+                try:
+                    self._preview_player.play(audio, samplerate=sr, device=device)
+                except Exception:
+                    device = self._resolve_aux_output_device(force_refresh=True)
+                    if device is None:
+                        raise RuntimeError("No non-virtual speaker output device is available for preview.")
+                    self._preview_player.play(audio, samplerate=sr, device=device)
             except Exception as exc:
                 self._reset_feed_play_buttons()
                 self.status_label.setText("Preview failed.")
@@ -2186,10 +3169,7 @@ class SoundboardWindow(QMainWindow):
 
     def stop_remote_preview(self, silent: bool = False) -> None:
         self._preview_request_id += 1
-        try:
-            sd.stop()
-        except Exception:
-            pass
+        self._preview_player.stop()
         self._current_preview_url = None
         self._preview_monitor.stop()
         self._reset_feed_play_buttons()
@@ -2224,11 +3204,7 @@ class SoundboardWindow(QMainWindow):
         if self._current_preview_url is None:
             self._preview_monitor.stop()
             return
-        try:
-            stream = sd.get_stream()
-            active = bool(stream is not None and stream.active)
-        except Exception:
-            active = False
+        active = self._preview_player.is_active()
         if not active:
             self._current_preview_url = None
             self._preview_monitor.stop()
@@ -2248,6 +3224,7 @@ class SoundboardWindow(QMainWindow):
         self._feed_loading = False
         self.fetch_btn.setEnabled(True)
         self.status_label.setText("Fetch timed out. Try reload.")
+        self._notify_desktop(self.status_label.text(), title="Feed Load", error=True)
 
     def _on_import_done(self, result: dict) -> None:
         imported = result.get("imported", [])
@@ -2256,6 +3233,7 @@ class SoundboardWindow(QMainWindow):
 
     def _on_import_error(self, message: str) -> None:
         self.status_label.setText("Import failed.")
+        self._notify_desktop(f"Import failed: {message}", title="Import", error=True)
         QMessageBox.critical(self, "Import Error", message)
 
     def _finalize_import(self, imported: list[str], skipped: list[str]) -> None:
@@ -2263,17 +3241,17 @@ class SoundboardWindow(QMainWindow):
         self._register_new_sounds(imported)
         if imported:
             self.status_label.setText(f"Imported {len(imported)} sound(s).")
+            self._notify_desktop(self.status_label.text(), title="Import")
         elif skipped:
             self.status_label.setText(skipped[0])
+            self._notify_desktop(self.status_label.text(), title="Import", error=True)
         else:
             self.status_label.setText("Nothing imported.")
+            self._notify_desktop(self.status_label.text(), title="Import")
 
     def _register_new_sounds(self, imported_paths: list[str]) -> None:
         if not imported_paths:
             return
-
-        existing_hotkeys = set(self.engine.soundboard.hotkeys.keys())
-        free_keys = [k for k in self.DEFAULT_KEYS if k not in existing_hotkeys]
 
         for path_str in imported_paths:
             path = Path(path_str)
@@ -2283,13 +3261,6 @@ class SoundboardWindow(QMainWindow):
             except Exception as exc:
                 print(f"Failed to load imported sound '{name}': {exc}")
                 continue
-
-            if free_keys:
-                key = free_keys.pop(0)
-                try:
-                    self.engine.soundboard.bind_hotkey(key, name)
-                except Exception as exc:
-                    print(f"Failed to bind hotkey '{key}' to '{name}': {exc}")
 
     def refresh_local(self) -> None:
         self.sounds_dir.mkdir(parents=True, exist_ok=True)
@@ -2313,8 +3284,8 @@ class SoundboardWindow(QMainWindow):
             item.setSizeHint(QSize(tile_w, tile_h))
             self._style_local_tile(item, visual_idx)
             visual_idx += 1
-            # Force non-checkable baseline; delete mode enables this explicitly.
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
             self.local_list.addItem(item)
         if self._delete_mode:
             self._set_delete_checkboxes(True)
@@ -2363,18 +3334,22 @@ class SoundboardWindow(QMainWindow):
 
     def _compute_local_tile_metrics(self) -> tuple[int, int, int]:
         spacing = max(12, self.local_list.spacing())
-        view_w = max(260, self.local_list.viewport().width())
-        min_tile_w = max(108, int(78 * PHI))
-        max_tile_w = 214
-        cols = max(1, min(6, int((view_w + spacing) / (min_tile_w + spacing))))
-        tile_w = int((view_w - (spacing * (cols + 1))) / cols)
+        view_w = max(300, self.local_list.viewport().width())
+        cols = 6
+        tile_w = int((view_w - (spacing * (cols - 1))) / cols)
+        min_tile_w = 100
+        max_tile_w = 150
         tile_w = max(min_tile_w, min(max_tile_w, tile_w))
-        tile_h = max(42, int(tile_w / (PHI * 1.18)))
+        tile_h = max(68, int(tile_w * 0.46))
         return tile_w, tile_h, spacing
 
     def _update_local_grid_size(self) -> None:
         tile_w, tile_h, spacing = self._compute_local_tile_metrics()
-        self.local_list.setGridSize(QSize(tile_w + spacing, tile_h + 12))
+        self.local_list.setGridSize(QSize(tile_w + spacing, tile_h + spacing))
+        visible_rows = 4
+        min_height = (tile_h * visible_rows) + (spacing * (visible_rows - 1)) + 32
+        self.local_list.setMinimumHeight(min_height)
+        self.local_list.setMinimumWidth(0)
 
     def _refresh_local_item_size_hints(self) -> None:
         tile_w, tile_h, _ = self._compute_local_tile_metrics()
@@ -2398,6 +3373,9 @@ class SoundboardWindow(QMainWindow):
         if self._delete_mode:
             self.status_label.setText("Exit delete mode to play sounds.")
             return
+        if not self.engine.is_soundboard_enabled():
+            self.status_label.setText("Soundboard is disabled (mic only).")
+            return
         file_name = item.text().strip()
         file_path = self.sounds_dir / file_name
         if not file_path.exists():
@@ -2407,6 +3385,7 @@ class SoundboardWindow(QMainWindow):
 
         sound_name = file_path.stem
         try:
+            self.engine.soundboard.stop_all()
             if sound_name not in self.engine.soundboard.sounds:
                 self.engine.soundboard.load_audio_file(sound_name, file_path)
             self.engine.soundboard.trigger(sound_name)
@@ -2431,6 +3410,41 @@ class SoundboardWindow(QMainWindow):
         self._animate_local_tile_click(item)
         if self._trim_mode:
             self._open_trim_editor_for_item(item)
+
+    def _show_local_context_menu(self, pos) -> None:
+        item = self.local_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self.local_list)
+        menu.setObjectName("LocalTileMenu")
+        play_action = menu.addAction("Play")
+        select_action = menu.addAction("Select")
+        rename_action = menu.addAction("Rename")
+        edit_action = menu.addAction("Edit (Trim)")
+        delete_action = menu.addAction("Delete")
+        menu.addSeparator()
+        select_all_action = menu.addAction("Select All")
+        delete_selected_action = menu.addAction("Delete Selected")
+
+        action = menu.exec(self.local_list.viewport().mapToGlobal(pos))
+        if action is None:
+            return
+        if action is play_action:
+            self.play_imported_item(item)
+        elif action is select_action:
+            item.setCheckState(Qt.CheckState.Checked if item.checkState() != Qt.CheckState.Checked else Qt.CheckState.Unchecked)
+        elif action is rename_action:
+            self._rename_imported_item(item)
+        elif action is edit_action:
+            self._open_trim_editor_for_item(item)
+        elif action is delete_action:
+            self._delete_single_imported(item)
+        elif action is select_all_action:
+            for i in range(self.local_list.count()):
+                it = self.local_list.item(i)
+                it.setCheckState(Qt.CheckState.Checked)
+        elif action is delete_selected_action:
+            self.delete_selected_imported()
 
     def _enter_trim_mode(self) -> None:
         if self._delete_mode:
@@ -2494,6 +3508,44 @@ class SoundboardWindow(QMainWindow):
         self.trim_dialog.activateWindow()
         self.status_label.setText(f"Trim editor opened for '{file_name}'.")
 
+    def _rename_imported_item(self, item: QListWidgetItem) -> None:
+        old_name = item.text().strip()
+        old_path = self.sounds_dir / old_name
+        if not old_path.exists():
+            self.status_label.setText("File not found.")
+            return
+        new_name, ok = QInputDialog.getText(self, "Rename Sound", "New name:", text=old_path.stem)
+        if not ok:
+            return
+        new_name = "".join(ch for ch in new_name if ch not in "/\\?*:|\"<>").strip()
+        if not new_name:
+            self.status_label.setText("Name cannot be empty.")
+            return
+        new_path = old_path.with_name(f"{new_name}{old_path.suffix}")
+        if new_path.exists():
+            self.status_label.setText("A sound with that name already exists.")
+            return
+        try:
+            old_path.rename(new_path)
+            item.setText(new_path.name)
+            self.status_label.setText(f"Renamed to '{new_path.name}'.")
+        except Exception as exc:
+            self.status_label.setText(f"Rename failed: {exc}")
+
+    def _delete_single_imported(self, item: QListWidgetItem) -> None:
+        file_name = item.text().strip()
+        file_path = self.sounds_dir / file_name
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except Exception as exc:
+            self.status_label.setText(f"Failed to delete '{file_name}': {exc}")
+            return
+        row = self.local_list.row(item)
+        self.local_list.takeItem(row)
+        self.engine.soundboard.sounds.pop(file_path.stem, None)
+        self.status_label.setText(f"Deleted '{file_name}'.")
+
     def close_trim_editor(self) -> None:
         self.stop_trim_preview(silent=True)
         self.trim_dialog.hide()
@@ -2542,6 +3594,7 @@ class SoundboardWindow(QMainWindow):
         if result.returncode != 0 or not trimmed_tmp.exists():
             trimmed_tmp.unlink(missing_ok=True)
             self.status_label.setText("Failed to trim selected audio.")
+            self._notify_desktop(self.status_label.text(), title="Trim", error=True)
             return
 
         self.stop_trim_preview(silent=True, reset_to_start=False)
@@ -2550,18 +3603,21 @@ class SoundboardWindow(QMainWindow):
         except Exception as exc:
             trimmed_tmp.unlink(missing_ok=True)
             self.status_label.setText(f"Failed to overwrite '{src.name}': {exc}")
+            self._notify_desktop(self.status_label.text(), title="Trim", error=True)
             return
 
         try:
             self.engine.soundboard.load_audio_file(src.stem, src)
         except Exception as exc:
             self.status_label.setText(f"Trim saved, but failed to reload sound: {exc}")
+            self._notify_desktop(self.status_label.text(), title="Trim", error=True)
             return
 
         try:
             audio, sr = _decode_audio_for_preview(src)
         except Exception as exc:
             self.status_label.setText(f"Trim saved, but failed to reopen editor: {exc}")
+            self._notify_desktop(self.status_label.text(), title="Trim", error=True)
             return
 
         self._trim_source_path = src
@@ -2585,6 +3641,7 @@ class SoundboardWindow(QMainWindow):
                 self.local_list.setCurrentItem(item)
                 break
         self.status_label.setText(f"Trim saved to '{src.name}'.")
+        self._notify_desktop(self.status_label.text(), title="Trim")
 
     def delete_selected_imported(self) -> None:
         if not self._delete_mode:
@@ -2602,7 +3659,6 @@ class SoundboardWindow(QMainWindow):
             return
 
         deleted = 0
-        hotkeys_need_rebuild = False
         for file_name in names:
             file_path = self.sounds_dir / file_name
             try:
@@ -2615,21 +3671,11 @@ class SoundboardWindow(QMainWindow):
 
             sound_name = file_path.stem
             self.engine.soundboard.sounds.pop(sound_name, None)
-            for hotkey, mapped_name in list(self.engine.soundboard.hotkeys.items()):
-                if mapped_name == sound_name:
-                    hotkeys_need_rebuild = True
-                    break
-
-        if hotkeys_need_rebuild:
-            try:
-                self.engine.soundboard.clear_hotkeys()
-                self.engine.soundboard.bind_hotkeys_auto()
-            except Exception as exc:
-                self.status_label.setText(f"Deleted files, but failed to rebuild hotkeys: {exc}")
 
         self._exit_delete_mode()
         self.refresh_local()
         self.status_label.setText(f"Deleted {deleted} sound(s).")
+        self._notify_desktop(self.status_label.text(), title="Delete")
 
     def _enter_delete_mode(self) -> None:
         if self._trim_mode:
@@ -2662,13 +3708,12 @@ class SoundboardWindow(QMainWindow):
     def _set_delete_checkboxes(self, enabled: bool) -> None:
         for i in range(self.local_list.count()):
             item = self.local_list.item(i)
-            flags = item.flags()
             if enabled:
-                item.setFlags(flags | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Unchecked)
             else:
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Unchecked)
-                item.setFlags(flags & ~Qt.ItemFlag.ItemIsUserCheckable)
 
     def _on_trim_range_changed(self, _value: int) -> None:
         if self._trim_updating_slider:
@@ -2808,7 +3853,8 @@ class SoundboardWindow(QMainWindow):
         return f"{minutes:02d}:{seconds:05.2f}"
 
     def update_soundboard_volume(self, slider_value: int) -> None:
-        gain = slider_value / 100.0
+        gain = max(0.0, min(2.0, slider_value / 100.0))
+        self._volume_state.soundboard_gain = gain
         self.engine.soundboard.set_volume(gain)
         self.soundboard_volume_label.setText(f"Soundboard Volume: {slider_value}%")
 
@@ -2848,54 +3894,124 @@ class SoundboardWindow(QMainWindow):
         self.speaker_monitor_label.setVisible(enabled)
         self.speaker_monitor_slider.setVisible(enabled)
         if not enabled:
-            try:
-                sd.stop()
-            except Exception:
-                pass
+            self._speaker_player.stop()
 
     def update_speaker_monitor_volume_label(self, slider_value: int) -> None:
+        gain = max(0.0, min(2.0, slider_value / 100.0))
+        self._volume_state.speaker_gain = gain
+        self._speaker_player.set_gain(gain)
         self.speaker_monitor_label.setText(f"Speaker Volume: {slider_value}%")
 
     def _play_sound_to_speaker_if_enabled(self, sound_name: str) -> None:
+        if not self.engine.is_soundboard_enabled():
+            return
         if not self.speaker_monitor_btn.isChecked():
             return
+        self.stop_remote_preview(silent=True)
         snd = self.engine.soundboard.sounds.get(sound_name)
         if snd is None:
             return
-        gain = self.speaker_monitor_slider.value() / 100.0
+        gain = float(self._volume_state.speaker_gain)
         if gain <= 0.0:
             return
         try:
-            audio = np.clip(snd.audio * gain, -1.0, 1.0)
-            sd.play(audio, samplerate=self.engine.samplerate, blocking=False)
+            device = self._resolve_aux_output_device()
+            if device is None:
+                self.status_label.setText("Speaker monitor needs a non-virtual output device.")
+                return
+            try:
+                self._speaker_player.play(snd.audio, samplerate=self.engine.samplerate, device=device)
+            except Exception:
+                device = self._resolve_aux_output_device(force_refresh=True)
+                if device is None:
+                    self.status_label.setText("Speaker monitor needs a non-virtual output device.")
+                    return
+                self._speaker_player.play(snd.audio, samplerate=self.engine.samplerate, device=device)
         except Exception as exc:
             self.status_label.setText(f"Speaker playback failed: {exc}")
 
     def update_preview_volume_label(self, slider_value: int) -> None:
+        gain = max(0.0, min(2.0, slider_value / 100.0))
+        self._volume_state.preview_gain = gain
+        self._preview_player.set_gain(gain)
         self.preview_volume_label.setText(f"Preview Volume: {slider_value}%")
 
     def update_mic_volume_label(self, slider_value: int) -> None:
-        value = max(0, min(100, int(slider_value)))
+        value = max(0, min(200, int(slider_value)))
         self.mic_volume_label.setText(f"Mic Volume: {value}%")
-        self.engine.set_mic_input_gain(value / 100.0)
+        gain = value / 100.0
+        self._volume_state.mic_gain = gain
+        self.engine.set_mic_input_gain(gain)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if not getattr(self, "_quitting", False) and self._tray_icon is not None and self._tray_icon.isVisible():
+            event.ignore()
+            self._hide_to_tray(show_notice=True)
+            return
+
+        self._persist_app_state()
+        self._fetch_timeout.stop()
+        self._preview_monitor.stop()
+        self._trim_play_timer.stop()
         self.stop_remote_preview(silent=True)
+        self._speaker_player.close()
         self.stop_trim_preview(silent=True)
-        self.engine.stop()
+        self.engine.shutdown()
+        if self._engine_thread.is_alive():
+            self._engine_thread.join(timeout=2.5)
+        for thread in list(self._threads):
+            try:
+                thread.quit()
+                thread.wait(500)
+            except Exception:
+                pass
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.hide()
+            except Exception:
+                pass
         super().closeEvent(event)
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if getattr(self, "_quitting", False):
+            return
+        if event.type() != QEvent.Type.WindowStateChange:
+            return
+        if self.isMinimized() and self._tray_icon is not None and self._tray_icon.isVisible():
+            QTimer.singleShot(0, lambda: self._hide_to_tray(show_notice=False))
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
+        self._apply_window_mask()
         self._update_local_grid_size()
         self._refresh_local_item_size_hints()
 
 
 def run_ui() -> int:
-    app = QApplication(sys.argv)
-    window = SoundboardWindow()
+    launched_from_startup = STARTUP_ARG in sys.argv
+    argv = [arg for arg in sys.argv if arg != STARTUP_ARG]
+    app = QApplication(argv)
+    app.setQuitOnLastWindowClosed(False)
+    app.setFont(QFont("Segoe UI", 11))
+
+    lock_path = Path(tempfile.gettempdir()) / "SoundboardEZ.lock"
+    instance_lock = QLockFile(str(lock_path))
+    instance_lock.setStaleLockTime(0)
+    if not instance_lock.tryLock(100):
+        if not launched_from_startup:
+            QMessageBox.information(None, "SoundboardEZ", "SoundboardEZ is already running.")
+        return 0
+
+    app.setProperty("_single_instance_lock", instance_lock)
+    window = SoundboardWindow(launched_from_startup=launched_from_startup)
     window.show()
-    return app.exec()
+    exit_code = app.exec()
+    try:
+        instance_lock.unlock()
+    except Exception:
+        pass
+    return exit_code
 
 
 if __name__ == "__main__":

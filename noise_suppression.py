@@ -248,6 +248,7 @@ class MicNoiseSuppressor:
         self.debug_error: str | None = None
         self._backend: _Backend | None = None
         self._states: list[Any] = []
+        self._tails: list[np.ndarray] = []
 
         if self.sample_rate != RNNOISE_SAMPLE_RATE:
             self.error_message = (
@@ -270,6 +271,7 @@ class MicNoiseSuppressor:
     def _clear_states(self) -> None:
         if self._backend is None or self._backend.destroy_state is None:
             self._states.clear()
+            self._tails.clear()
             return
         for state in self._states:
             try:
@@ -277,6 +279,7 @@ class MicNoiseSuppressor:
             except Exception:
                 pass
         self._states.clear()
+        self._tails.clear()
 
     def reset(self) -> None:
         self._clear_states()
@@ -288,12 +291,13 @@ class MicNoiseSuppressor:
         if self._backend is None:
             return
         target = max(1, int(channels))
-        if len(self._states) == target:
+        if len(self._states) == target and len(self._tails) == target:
             return
         self._clear_states()
         self._states = [self._backend.create_state() for _ in range(target)]
+        self._tails = [np.zeros(0, dtype=np.float32) for _ in range(target)]
 
-    def _process_channel(self, samples: np.ndarray, state: Any) -> np.ndarray:
+    def _process_channel(self, samples: np.ndarray, state: Any, channel_idx: int) -> np.ndarray:
         if self._backend is None:
             return np.ascontiguousarray(samples, dtype=np.float32)
         samples_in = np.ascontiguousarray(samples, dtype=np.float32)
@@ -301,24 +305,54 @@ class MicNoiseSuppressor:
         if total == 0:
             return np.ascontiguousarray(samples_in, dtype=np.float32)
 
-        out = np.empty(total, dtype=np.float32)
+        if channel_idx < len(self._tails):
+            tail = self._tails[channel_idx]
+        else:
+            tail = np.zeros(0, dtype=np.float32)
+        carry_samples = int(tail.shape[0])
+
+        if carry_samples > 0:
+            merged = np.concatenate((tail, samples_in))
+        else:
+            merged = samples_in
+        merged = np.ascontiguousarray(merged, dtype=np.float32)
+        merged_total = int(merged.shape[0])
+        full_len = (merged_total // self.frame_size) * self.frame_size
+
+        if channel_idx < len(self._tails):
+            self._tails[channel_idx] = np.ascontiguousarray(merged[full_len:], dtype=np.float32)
+
+        if full_len <= 0:
+            return np.ascontiguousarray(samples_in, dtype=np.float32)
+
+        processed_full = np.empty(full_len, dtype=np.float32)
         offset = 0
-        while offset < total:
-            end = min(offset + self.frame_size, total)
-            chunk_len = end - offset
-            if chunk_len == self.frame_size:
-                frame = samples_in[offset:end]
-            else:
-                frame = np.zeros(self.frame_size, dtype=np.float32)
-                frame[:chunk_len] = samples_in[offset:end]
+        while offset < full_len:
+            end = offset + self.frame_size
+            frame = merged[offset:end]
             processed = self._backend.process(state, frame)
             processed = np.ascontiguousarray(processed, dtype=np.float32)
             if processed.shape[0] < self.frame_size:
                 repaired = np.zeros(self.frame_size, dtype=np.float32)
                 repaired[: processed.shape[0]] = processed
                 processed = repaired
-            out[offset:end] = processed[:chunk_len]
+            processed_full[offset:end] = processed[: self.frame_size]
             offset = end
+
+        out_start = carry_samples
+        out_end = out_start + total
+        if out_end <= full_len:
+            return np.ascontiguousarray(processed_full[out_start:out_end], dtype=np.float32)
+
+        out = np.empty(total, dtype=np.float32)
+        processed_count = max(0, full_len - out_start)
+        if processed_count > 0:
+            out[:processed_count] = processed_full[out_start:full_len]
+        if processed_count < total:
+            raw_needed = total - processed_count
+            raw_start = full_len
+            raw_end = raw_start + raw_needed
+            out[processed_count:] = merged[raw_start:raw_end]
         return out
 
     def process_mic_frame(self, audio_frame: np.ndarray) -> np.ndarray:
@@ -328,14 +362,14 @@ class MicNoiseSuppressor:
 
         if frame.ndim == 1:
             self._ensure_states(1)
-            return self._process_channel(frame, self._states[0])
+            return self._process_channel(frame, self._states[0], 0)
 
         if frame.ndim == 2:
             channels = int(frame.shape[1])
             self._ensure_states(channels)
             out = np.empty_like(frame, dtype=np.float32)
             for ch in range(channels):
-                out[:, ch] = self._process_channel(frame[:, ch], self._states[ch])
+                out[:, ch] = self._process_channel(frame[:, ch], self._states[ch], ch)
             return out
 
         return np.ascontiguousarray(frame, dtype=np.float32)
