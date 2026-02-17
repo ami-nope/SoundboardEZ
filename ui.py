@@ -1141,7 +1141,8 @@ class FramelessImporterDialog(QDialog):
         self.setWindowFlags(
             Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # Reduce GPU composition artifacts (black/pointy ghost rectangles) on some systems.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self._dragging = False
         self._drag_offset = QPoint()
 
@@ -1189,7 +1190,8 @@ class SoundboardWindow(QMainWindow):
     def __init__(self, launched_from_startup: bool = False) -> None:
         super().__init__()
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # Reduce GPU composition artifacts (black/pointy ghost rectangles) on some systems.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setWindowTitle("SoundboardEZ")
         self.resize(920, 520)
         self.setMinimumSize(920, 520)
@@ -1295,6 +1297,8 @@ class SoundboardWindow(QMainWindow):
         shadow.setBlurRadius(34.0)
         shadow.setOffset(0.0, 12.0)
         shadow.setColor(QColor(4, 12, 27, 165))
+        if not self.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground):
+            shadow.setEnabled(False)
         self.window_shell.setGraphicsEffect(shadow)
         self._shell_shadow = shadow
 
@@ -1697,6 +1701,8 @@ class SoundboardWindow(QMainWindow):
         importer_shadow.setBlurRadius(38)
         importer_shadow.setOffset(0, 14)
         importer_shadow.setColor(QColor(4, 11, 24, 180))
+        if not self.importer_window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground):
+            importer_shadow.setEnabled(False)
         self.importer_shell.setGraphicsEffect(importer_shadow)
         importer_shell_layout = QVBoxLayout(self.importer_shell)
         importer_shell_layout.setContentsMargins(20, 20, 20, 20)

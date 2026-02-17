@@ -17,7 +17,7 @@ sounds_dir = project_root / "sounds"
 
 datas = []
 binaries = []
-hiddenimports = ["PyQt6.sip"]
+hiddenimports = ["PyQt6.sip", "pyrnnoise"]
 
 # Icon
 icon_path = assets_dir / "app.ico"

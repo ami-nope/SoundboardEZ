@@ -21,6 +21,12 @@ class _Backend:
     destroy_state: Callable[[Any], None] | None = None
 
 
+@dataclass
+class _FallbackState:
+    noise_floor: float = 0.008
+    gain: float = 1.0
+
+
 def _coerce_frame_candidate(value: Any) -> np.ndarray | None:
     try:
         arr = np.asarray(value, dtype=np.float32)
@@ -235,7 +241,42 @@ def _load_backend() -> tuple[_Backend | None, str | None]:
     details = " | ".join(err for err in (py_error, c_error) if err)
     if not details:
         details = "RNNoise backend unavailable."
-    return None, details
+    return _load_builtin_backend(), details
+
+
+def _load_builtin_backend() -> _Backend:
+    def create_state() -> _FallbackState:
+        return _FallbackState()
+
+    def process(state: _FallbackState, frame: np.ndarray) -> np.ndarray:
+        frame_in = np.ascontiguousarray(frame, dtype=np.float32)
+        if frame_in.size == 0:
+            return frame_in
+
+        rms = float(np.sqrt(np.mean(frame_in * frame_in)) + 1e-8)
+        floor_target = min(rms, state.noise_floor * 4.0 + 0.02)
+        state.noise_floor = max(0.002, min(0.08, state.noise_floor * 0.98 + floor_target * 0.02))
+        threshold = max(0.006, state.noise_floor * 2.4)
+
+        if rms <= threshold:
+            target_gain = max(0.12, min(1.0, rms / (threshold + 1e-8)))
+        else:
+            target_gain = 1.0
+
+        # Faster attenuation than recovery keeps hiss/noise floor lower.
+        if target_gain < state.gain:
+            state.gain = state.gain * 0.55 + target_gain * 0.45
+        else:
+            state.gain = state.gain * 0.92 + target_gain * 0.08
+
+        out = frame_in * np.float32(state.gain)
+        return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
+
+    return _Backend(
+        name="builtin.noise_gate",
+        create_state=create_state,
+        process=process,
+    )
 
 
 class MicNoiseSuppressor:
@@ -267,6 +308,8 @@ class MicNoiseSuppressor:
         self._backend = backend
         self.backend_name = backend.name
         self.available = True
+        if error:
+            self.debug_error = error
 
     def _clear_states(self) -> None:
         if self._backend is None or self._backend.destroy_state is None:
