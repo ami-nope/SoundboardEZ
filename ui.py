@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import math
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -32,9 +35,10 @@ from PyQt6.QtCore import (
     pyqtProperty,
     pyqtSignal,
 )
-from PyQt6.QtGui import QAction, QColor, QBrush, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QRegion
+from PyQt6.QtGui import QAction, QColor, QBrush, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen, QRegion
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QAbstractScrollArea,
     QApplication,
     QComboBox,
     QDialog,
@@ -52,6 +56,8 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QMenu,
+    QProgressBar,
+    QProgressDialog,
     QPushButton,
     QInputDialog,
     QScrollArea,
@@ -67,10 +73,44 @@ from PyQt6.QtWidgets import (
 
 from audio_engine import AudioEngine
 from app_state import AppState, load_app_state, save_app_state
-from scraper import MYINSTANTS_INDEX_URL, fetch_myinstants_sounds_page
+from scraper import MYINSTANTS_INDEX_URL, download_via_dotnet, fetch_myinstants_sounds_page
 from startup_manager import STARTUP_ARG, is_startup_enabled, set_startup_enabled
+from update_checker import UpdateInfo, check_for_update
+from updater import download_file, download_delta_files, launch_apply_and_exit
+from version import APP_VERSION
 
 PHI = 1.618
+SKIP_UPDATE_ONCE_ARG = "--skip-update-once"
+FEED_BUTTON_STYLE = """
+    QPushButton {
+        border-radius: 12px;
+        border: 1px solid rgba(148, 163, 184, 52);
+        font-size: 13px;
+        font-weight: 600;
+        min-height: 0px;
+        max-height: 32px;
+        padding: 0px 10px;
+        color: #eaf2fb;
+        background: rgba(64, 82, 108, 220);
+    }
+    QPushButton:hover {
+        background: rgba(81, 101, 130, 230);
+        border-color: rgba(96, 214, 255, 188);
+    }
+    QPushButton:pressed {
+        background: rgba(58, 77, 102, 235);
+    }
+    QPushButton[active="true"] {
+        background: #0f6f98;
+        border-color: #62d6ff;
+        color: #f7fbff;
+    }
+    QPushButton:disabled {
+        background: rgba(27, 39, 58, 220);
+        border-color: rgba(71, 85, 105, 120);
+        color: #8fa5c1;
+    }
+"""
 
 
 @dataclass(frozen=True)
@@ -88,6 +128,13 @@ class RuntimeVolumeState:
 
 
 class ManagedOutputPlayer:
+    """Plays audio to an output device using a callback-driven stream.
+
+    All potentially slow PortAudio operations (open / start / stop / close)
+    are performed on a private background thread so the caller (usually the
+    Qt UI thread) never blocks.
+    """
+
     def __init__(self, gain: float = 1.0) -> None:
         self._lock = threading.Lock()
         self._stream: sd.OutputStream | None = None
@@ -131,6 +178,7 @@ class ManagedOutputPlayer:
         samplerate: int,
         device: str | int | None = None,
     ) -> None:
+        """Start playback.  The heavy PortAudio work runs off-thread."""
         arr = np.asarray(audio, dtype=np.float32)
         if arr.ndim == 1:
             arr = arr.reshape(-1, 1)
@@ -139,55 +187,76 @@ class ManagedOutputPlayer:
         arr = np.ascontiguousarray(np.clip(arr, -1.0, 1.0), dtype=np.float32)
         channels = int(arr.shape[1])
 
+        # Mark as active; actual stop + open happen on the daemon thread
+        # so no PortAudio call ever blocks the caller.
         with self._lock:
-            self._stop_locked()
             self._active = True
 
-        position = 0
-
-        def callback(outdata, frames, _time, _status):
-            nonlocal position
-            end = min(position + frames, arr.shape[0])
-            n = end - position
-            outdata.fill(0.0)
-            if n > 0:
-                out_view = outdata[:n, :channels]
-                out_view[:] = arr[position:end]
-                with self._lock:
-                    gain_now = float(self._gain)
-                if gain_now != 1.0:
-                    out_view *= np.float32(gain_now)
-                    np.clip(out_view, -1.0, 1.0, out=out_view)
-            position = end
-            if position >= arr.shape[0]:
-                raise sd.CallbackStop
-
-        holder: dict[str, sd.OutputStream | None] = {"stream": None}
-
-        def finished_callback() -> None:
-            stream_ref = holder["stream"]
-            if stream_ref is not None:
-                try:
-                    stream_ref.close()
-                except Exception:
-                    pass
+        def _open_and_start() -> None:
+            # Stop the previous stream *on this background thread* so
+            # Pa_StopStream / Pa_CloseStream never stall the UI.
             with self._lock:
-                self._active = False
-                if self._stream is holder["stream"]:
-                    self._stream = None
+                self._stop_locked()
+                self._active = True  # Re-arm after stop clears the flag
+            try:
+                position = 0
 
-        stream = sd.OutputStream(
-            samplerate=int(samplerate),
-            channels=channels,
-            dtype="float32",
-            device=device,
-            callback=callback,
-            finished_callback=finished_callback,
-        )
-        holder["stream"] = stream
-        with self._lock:
-            self._stream = stream
-        stream.start()
+                def callback(outdata, frames, _time, _status):
+                    nonlocal position
+                    end = min(position + frames, arr.shape[0])
+                    n = end - position
+                    outdata.fill(0.0)
+                    if n > 0:
+                        out_view = outdata[:n, :channels]
+                        out_view[:] = arr[position:end]
+                        with self._lock:
+                            gain_now = float(self._gain)
+                        if gain_now != 1.0:
+                            out_view *= np.float32(gain_now)
+                            np.clip(out_view, -1.0, 1.0, out=out_view)
+                    position = end
+                    if position >= arr.shape[0]:
+                        raise sd.CallbackStop
+
+                holder: dict[str, sd.OutputStream | None] = {"stream": None}
+
+                def finished_callback() -> None:
+                    stream_ref = holder["stream"]
+                    if stream_ref is not None:
+                        try:
+                            stream_ref.close()
+                        except Exception:
+                            pass
+                    with self._lock:
+                        self._active = False
+                        if self._stream is holder["stream"]:
+                            self._stream = None
+
+                stream = sd.OutputStream(
+                    samplerate=int(samplerate),
+                    channels=channels,
+                    dtype="float32",
+                    device=device,
+                    callback=callback,
+                    finished_callback=finished_callback,
+                )
+                holder["stream"] = stream
+                with self._lock:
+                    # If stop() was called while we were opening, bail out.
+                    if not self._active:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                        return
+                    self._stream = stream
+                stream.start()
+            except Exception as exc:
+                with self._lock:
+                    self._active = False
+                print(f"ManagedOutputPlayer stream error: {exc}")
+
+        threading.Thread(target=_open_and_start, daemon=True).start()
 
 
 def _safe_name(name: str) -> str:
@@ -216,10 +285,51 @@ def _url_suffix(url: str) -> str:
     return suffix
 
 
-def _download(url: str, timeout: float = 20.0) -> bytes:
-    response = requests.get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.content
+def _download_to_path_streaming(
+    url: str,
+    dst_path: Path,
+    timeout: float = 20.0,
+    progress_cb=None,
+    chunk_size: int = 256 * 1024,
+) -> tuple[int, int | None]:
+    downloaded = 0
+    total_size: int | None = None
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Try Python requests first; if TLS fails, fall back to .NET on Windows.
+    try:
+        with requests.get(url, timeout=timeout, stream=True) as response:
+            response.raise_for_status()
+            content_length = str(response.headers.get("content-length", "")).strip()
+            if content_length.isdigit():
+                total_size = int(content_length)
+            if callable(progress_cb):
+                progress_cb(downloaded, total_size)
+            with dst_path.open("wb") as fh:
+                for chunk in response.iter_content(chunk_size=max(32 * 1024, int(chunk_size))):
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    if callable(progress_cb):
+                        progress_cb(downloaded, total_size)
+        return downloaded, total_size
+    except (requests.ConnectionError, requests.exceptions.SSLError):
+        # TLS handshake rejected (Cloudflare) — use .NET fallback on Windows.
+        if sys.platform != "win32":
+            raise
+
+    # .NET fallback: download the entire file, then report final size.
+    dst_path.unlink(missing_ok=True)
+    if callable(progress_cb):
+        progress_cb(0, None)
+    download_via_dotnet(url, str(dst_path), timeout=timeout)
+    if not dst_path.exists():
+        raise RuntimeError("Download via .NET produced no file")
+    file_size = dst_path.stat().st_size
+    if callable(progress_cb):
+        progress_cb(file_size, file_size)
+    return file_size, file_size
 
 
 def _ffmpeg_exists() -> bool:
@@ -339,6 +449,81 @@ def _get_ffmpeg_exe() -> str | None:
         return None
 
 
+def _runtime_install_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        try:
+            return Path(sys.executable).resolve().parent
+        except Exception:
+            pass
+    return Path(__file__).resolve().parent
+
+
+def _default_user_sounds_dir() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        return Path(local_app_data) / "SoundboardEZ" / "sounds"
+    return Path.home() / "AppData" / "Local" / "SoundboardEZ" / "sounds"
+
+
+def _is_writable_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return False
+    probe = path / f".sbz_write_probe_{os.getpid()}_{int(time.time() * 1000)}.tmp"
+    try:
+        with probe.open("wb") as fh:
+            fh.write(b"ok")
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _seed_runtime_sounds_if_empty(target_dir: Path, source_dir: Path) -> None:
+    try:
+        if any(target_dir.iterdir()):
+            return
+    except Exception:
+        return
+    if not source_dir.is_dir():
+        return
+    supported = {".wav", ".mp3", ".ogg", ".m4a", ".aac", ".flac"}
+    for src in sorted(source_dir.iterdir()):
+        if not src.is_file() or src.suffix.lower() not in supported:
+            continue
+        dst = target_dir / src.name
+        if dst.exists():
+            continue
+        try:
+            shutil.copy2(src, dst)
+        except Exception:
+            continue
+
+
+def _resolve_runtime_sounds_dir() -> Path:
+    install_sounds = _runtime_install_dir() / "sounds"
+    user_sounds = _default_user_sounds_dir()
+    fallback = Path(tempfile.gettempdir()) / "SoundboardEZ" / "sounds"
+    if getattr(sys, "frozen", False):
+        candidates = [user_sounds, install_sounds, fallback]
+    else:
+        candidates = [Path("sounds"), user_sounds, fallback]
+
+    for candidate in candidates:
+        if not _is_writable_dir(candidate):
+            continue
+        if candidate == user_sounds:
+            _seed_runtime_sounds_if_empty(candidate, install_sounds)
+        return candidate
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
 class FetchWorker(QObject):
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
@@ -359,6 +544,7 @@ class FetchWorker(QObject):
 class ImportWorker(QObject):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
+    progress = pyqtSignal(object)
 
     def __init__(self, selected: list[RemoteSoundItem], sounds_dir: Path) -> None:
         super().__init__()
@@ -373,8 +559,17 @@ class ImportWorker(QObject):
             ffmpeg_ready = _ffmpeg_exists()
             existing_basenames = {p.stem.lower() for p in self.sounds_dir.iterdir() if p.is_file()}
             batch_basenames: set[str] = set()
+            total_items = max(1, len(self.selected))
 
-            for item in self.selected:
+            for idx, item in enumerate(self.selected, start=1):
+                self.progress.emit(
+                    {
+                        "phase": "item-start",
+                        "item_name": item.name,
+                        "item_index": idx,
+                        "total_items": total_items,
+                    }
+                )
                 base = _safe_name(item.name)
                 base_key = base.lower()
                 if base_key in existing_basenames or base_key in batch_basenames:
@@ -385,9 +580,32 @@ class ImportWorker(QObject):
                     suffix = ".wav"
                 out_path = self.sounds_dir / f"{base}{suffix}"
 
-                data = _download(item.url)
-                if _url_suffix(item.url) in {".wav", ".mp3"}:
-                    out_path.write_bytes(data)
+                last_emit = [0.0]
+
+                def progress_cb(downloaded: int, total: int | None) -> None:
+                    now = time.monotonic()
+                    if total is not None and downloaded < total and now - last_emit[0] < 0.08:
+                        return
+                    last_emit[0] = now
+                    self.progress.emit(
+                        {
+                            "phase": "download",
+                            "item_name": item.name,
+                            "item_index": idx,
+                            "total_items": total_items,
+                            "downloaded_bytes": int(downloaded),
+                            "total_bytes": int(total) if total is not None else None,
+                        }
+                    )
+
+                direct_suffix = _url_suffix(item.url)
+                if direct_suffix in {".wav", ".mp3"}:
+                    try:
+                        _download_to_path_streaming(item.url, out_path, progress_cb=progress_cb)
+                    except Exception as exc:
+                        out_path.unlink(missing_ok=True)
+                        skipped.append(f"{item.name} ({exc})")
+                        continue
                     imported.append(str(out_path))
                     existing_basenames.add(base_key)
                     batch_basenames.add(base_key)
@@ -399,8 +617,13 @@ class ImportWorker(QObject):
 
                 src_suffix = Path(urlparse(item.url).path).suffix or ".bin"
                 with tempfile.NamedTemporaryFile(delete=False, suffix=src_suffix) as tmp:
-                    tmp.write(data)
                     src_path = Path(tmp.name)
+                try:
+                    _download_to_path_streaming(item.url, src_path, progress_cb=progress_cb)
+                except Exception as exc:
+                    src_path.unlink(missing_ok=True)
+                    skipped.append(f"{item.name} ({exc})")
+                    continue
 
                 try:
                     if _convert_to_wav_ffmpeg(src_path, out_path):
@@ -411,6 +634,86 @@ class ImportWorker(QObject):
                         skipped.append(f"{item.name} (ffmpeg conversion failed)")
                 finally:
                     src_path.unlink(missing_ok=True)
+
+            self.finished.emit({"imported": imported, "skipped": skipped})
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class FileImportWorker(QObject):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(object)
+
+    def __init__(self, source_files: list[str], sounds_dir: Path) -> None:
+        super().__init__()
+        self.source_files = [str(p) for p in source_files]
+        self.sounds_dir = Path(sounds_dir)
+
+    def run(self) -> None:
+        try:
+            self.sounds_dir.mkdir(parents=True, exist_ok=True)
+            imported: list[str] = []
+            skipped: list[str] = []
+            existing_basenames = {p.stem.lower() for p in self.sounds_dir.iterdir() if p.is_file()}
+            total_items = max(1, len(self.source_files))
+
+            for idx, src_str in enumerate(self.source_files, start=1):
+                src = Path(src_str)
+                self.progress.emit(
+                    {
+                        "phase": "item-start",
+                        "item_name": src.name,
+                        "item_index": idx,
+                        "total_items": total_items,
+                    }
+                )
+                if not src.exists():
+                    skipped.append(f"{src.name} (missing)")
+                    continue
+                base = _safe_name(src.stem)
+                if base.lower() in existing_basenames:
+                    skipped.append(f"{src.name} (duplicate name)")
+                    continue
+
+                dst = self.sounds_dir / f"{base}{src.suffix.lower()}"
+                total_bytes = 0
+                try:
+                    total_bytes = max(0, int(src.stat().st_size))
+                except Exception:
+                    total_bytes = 0
+
+                copied = 0
+                try:
+                    with src.open("rb") as in_fh, dst.open("wb") as out_fh:
+                        while True:
+                            chunk = in_fh.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            out_fh.write(chunk)
+                            copied += len(chunk)
+                            self.progress.emit(
+                                {
+                                    "phase": "copy",
+                                    "item_name": src.name,
+                                    "item_index": idx,
+                                    "total_items": total_items,
+                                    "downloaded_bytes": int(copied),
+                                    "total_bytes": int(total_bytes) if total_bytes > 0 else None,
+                                }
+                            )
+                    try:
+                        shutil.copystat(src, dst)
+                    except Exception:
+                        pass
+                    imported.append(str(dst))
+                    existing_basenames.add(base.lower())
+                except Exception as exc:
+                    try:
+                        dst.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    skipped.append(f"{src.name} ({exc})")
 
             self.finished.emit({"imported": imported, "skipped": skipped})
         except Exception as exc:
@@ -500,17 +803,14 @@ class PreviewWorker(QObject):
         self.volume = max(0.0, min(1.0, float(volume)))
 
     def run(self) -> None:
-        src_path: Path | None = None
         temp_src: Path | None = None
         try:
-            data = _download(self.item.url)
             src_suffix = Path(urlparse(self.item.url).path).suffix or ".bin"
             with tempfile.NamedTemporaryFile(delete=False, suffix=src_suffix) as tmp:
-                tmp.write(data)
-                src_path = Path(tmp.name)
-                temp_src = src_path
+                temp_src = Path(tmp.name)
+            _download_to_path_streaming(self.item.url, temp_src)
 
-            audio, sr = _decode_audio_for_preview(src_path)
+            audio, sr = _decode_audio_for_preview(temp_src)
             np.clip(audio, -1.0, 1.0, out=audio)
             self.finished.emit(
                 {"item": self.item, "audio": np.ascontiguousarray(audio, dtype=np.float32), "sr": sr}
@@ -520,6 +820,226 @@ class PreviewWorker(QObject):
         finally:
             if temp_src is not None:
                 temp_src.unlink(missing_ok=True)
+
+
+class SoundLoadWorker(QObject):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(object)
+
+    def __init__(self, engine: AudioEngine, imported_paths: list[str]) -> None:
+        super().__init__()
+        self.engine = engine
+        self.imported_paths = [str(p) for p in imported_paths]
+
+    def run(self) -> None:
+        try:
+            loaded = 0
+            failed: list[str] = []
+            total_items = max(1, len(self.imported_paths))
+            for idx, path_str in enumerate(self.imported_paths, start=1):
+                path = Path(path_str)
+                sound_name = path.stem
+                self.progress.emit(
+                    {
+                        "phase": "cache",
+                        "item_name": path.name,
+                        "item_index": idx,
+                        "total_items": total_items,
+                    }
+                )
+                try:
+                    self.engine.soundboard.load_audio_file(sound_name, path)
+                    loaded += 1
+                except Exception as exc:
+                    failed.append(f"{path.name}: {exc}")
+            self.finished.emit({"loaded": loaded, "failed": failed})
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class AudioDecodeWorker(QObject):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, source_path: str | Path) -> None:
+        super().__init__()
+        self.source_path = Path(source_path)
+
+    def run(self) -> None:
+        try:
+            audio, sr = _decode_audio_for_preview(self.source_path)
+            self.finished.emit(
+                {
+                    "path": str(self.source_path),
+                    "audio": np.ascontiguousarray(audio, dtype=np.float32),
+                    "sr": int(sr),
+                }
+            )
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class TrimApplyWorker(QObject):
+    """Runs ffmpeg trim + sound reload off the UI thread."""
+
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        ffmpeg_exe: str,
+        src: Path,
+        start: float,
+        length: float,
+        engine: AudioEngine,
+    ) -> None:
+        super().__init__()
+        self.ffmpeg_exe = ffmpeg_exe
+        self.src = Path(src)
+        self.start = float(start)
+        self.length = float(length)
+        self.engine = engine
+
+    def run(self) -> None:
+        trimmed_tmp: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=self.src.suffix or ".wav") as tmp:
+                trimmed_tmp = Path(tmp.name)
+            cmd = [
+                self.ffmpeg_exe,
+                "-y",
+                "-v",
+                "error",
+                "-ss",
+                f"{self.start:.3f}",
+                "-t",
+                f"{self.length:.3f}",
+                "-i",
+                str(self.src),
+                "-vn",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                str(trimmed_tmp),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0 or not trimmed_tmp.exists():
+                trimmed_tmp.unlink(missing_ok=True)
+                self.error.emit("ffmpeg failed to trim the audio.")
+                return
+
+            trimmed_tmp.replace(self.src)
+
+            try:
+                self.engine.soundboard.load_audio_file(self.src.stem, self.src)
+            except Exception as exc:
+                self.finished.emit({"ok": True, "reload_error": str(exc)})
+                return
+            self.finished.emit({"ok": True})
+        except Exception as exc:
+            if trimmed_tmp is not None:
+                trimmed_tmp.unlink(missing_ok=True)
+            self.error.emit(str(exc))
+
+
+class RouteApplyWorker(QObject):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        engine: AudioEngine,
+        restart_fn,
+        input_device,
+        output_device,
+        old_input_device,
+        old_output_device,
+    ) -> None:
+        super().__init__()
+        self.engine = engine
+        self.restart_fn = restart_fn
+        self.input_device = input_device
+        self.output_device = output_device
+        self.old_input_device = old_input_device
+        self.old_output_device = old_output_device
+
+    def run(self) -> None:
+        try:
+            self.engine.input_device = self.input_device
+            self.engine.output_device = self.output_device
+            ok, err = self.restart_fn()
+            if ok:
+                self.finished.emit({"ok": True})
+                return
+
+            self.engine.input_device = self.old_input_device
+            self.engine.output_device = self.old_output_device
+            rollback_ok, rollback_err = self.restart_fn()
+            self.finished.emit(
+                {
+                    "ok": False,
+                    "err": err,
+                    "rollback_ok": rollback_ok,
+                    "rollback_err": rollback_err,
+                }
+            )
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class StartupUpdateWorker(QObject):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(int, int)
+    stage = pyqtSignal(str)
+
+    def __init__(self, update: UpdateInfo, update_root: Path) -> None:
+        super().__init__()
+        self.update = update
+        self.update_root = Path(update_root)
+
+    def run(self) -> None:
+        try:
+            self.update_root.mkdir(parents=True, exist_ok=True)
+
+            def on_progress(downloaded: int, total: int | None) -> None:
+                total_value = int(total) if isinstance(total, int) and total > 0 else -1
+                self.progress.emit(int(max(0, downloaded)), total_value)
+
+            if self.update.is_delta:
+                # Delta: download individual patch files
+                self.stage.emit("download")
+                delta_dir = self.update_root / "delta_files"
+                delta_pairs = [(df.relative_path, df.url) for df in self.update.delta_files]
+                download_delta_files(delta_pairs, delta_dir, progress_cb=on_progress)
+                self.finished.emit(
+                    {
+                        "mode": "delta",
+                        "temp_dir": str(delta_dir),
+                        "version": str(self.update.version),
+                    }
+                )
+            else:
+                # Full: download zip package
+                self.stage.emit("download")
+                package_path = self.update_root / "update.pkg"
+                download_file(self.update.full_url, package_path, progress_cb=on_progress)
+                # Keep the .pkg inside a dedicated temp dir for the applier
+                full_dir = self.update_root / "full_pkg"
+                full_dir.mkdir(parents=True, exist_ok=True)
+                final_pkg = full_dir / "update.pkg"
+                package_path.replace(final_pkg)
+                self.finished.emit(
+                    {
+                        "mode": "full",
+                        "temp_dir": str(full_dir),
+                        "version": str(self.update.version),
+                    }
+                )
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 class SmoothListWidget(QListWidget):
@@ -565,6 +1085,106 @@ class SmoothListWidget(QListWidget):
         self._scroll_anim.setEndValue(target)
         self._scroll_anim.start()
         event.accept()
+
+
+def _scroll_to_parent_area(widget: QWidget, event) -> None:
+    delta = event.pixelDelta().y()
+    if delta == 0:
+        angle_delta = event.angleDelta().y()
+        if angle_delta != 0:
+            delta = int((angle_delta / 120.0) * 36)
+    if delta == 0:
+        return
+    parent = widget.parentWidget()
+    while parent is not None:
+        if isinstance(parent, QAbstractScrollArea):
+            bar = parent.verticalScrollBar()
+            if bar is not None and bar.maximum() > bar.minimum():
+                bar.setValue(bar.value() - delta)
+                return
+        parent = parent.parentWidget()
+
+
+class NoWheelSlider(QSlider):
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        _scroll_to_parent_area(self, event)
+        event.ignore()
+
+
+class NoWheelComboBox(QComboBox):
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        _scroll_to_parent_area(self, event)
+        event.ignore()
+
+
+def _apply_dwm_rounded_corners(widget: QWidget) -> None:
+    """Ask the Windows 11+ DWM compositor to clip the window to round corners.
+
+    This is the most reliable way to eliminate black/sharp ghost borders
+    because the compositor itself applies the clipping before the surface
+    reaches the screen — no `QRegion` mask or QPainter trick can match it.
+    On older Windows versions or non-Windows platforms the call silently
+    does nothing.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        hwnd = int(widget.winId())
+        DWMWA_WINDOW_CORNER_PREFERENCE = 33  # Windows 11 Build 22000+
+        DWMWCP_ROUND = 2  # fully rounded
+        preference = ctypes.c_int(DWMWCP_ROUND)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.wintypes.HWND(hwnd),
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            ctypes.byref(preference),
+            ctypes.sizeof(preference),
+        )
+        # Suppress the DWM-drawn window border (appears as a white/light
+        # outline on Windows 11).  DWMWA_COLOR_NONE = 0xFFFFFFFE.
+        DWMWA_BORDER_COLOR = 34
+        DWMWA_COLOR_NONE = 0xFFFFFFFE
+        border_color = ctypes.wintypes.DWORD(DWMWA_COLOR_NONE)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.wintypes.HWND(hwnd),
+            DWMWA_BORDER_COLOR,
+            ctypes.byref(border_color),
+            ctypes.sizeof(border_color),
+        )
+    except Exception:
+        pass  # Pre-Win11 or missing dwmapi – fine, CSS handles it.
+
+
+class RoundedContainer(QFrame):
+    """Main visual container with CSS-driven rounded corners.
+
+    Because the top-level window uses ``WA_TranslucentBackground``, the
+    compositor blends only the painted regions. CSS ``border-radius`` on
+    this ``QFrame`` (with ``WA_StyledBackground``) correctly leaves the
+    corners transparent, giving perfectly smooth rounded edges.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("RoundedContainer")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+
+
+class _WindowBackdrop(QWidget):
+    """Central widget of the main window.
+
+    Fully transparent backdrop – all visuals come from the child
+    ``RoundedContainer`` via CSS.  No manual shadow painting so that
+    nothing leaks outside the rounded container's bounds.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("WindowBackdrop")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
 
 class ButtonMotionFilter(QObject):
@@ -737,6 +1357,8 @@ class MacTrafficButton(QPushButton):
 
 
 class LocalTileDelegate(QStyledItemDelegate):
+    _cached_tile_font: QFont | None = None
+
     @staticmethod
     def _toggle_check_state(model, index) -> None:
         state = index.data(int(Qt.ItemDataRole.CheckStateRole))
@@ -809,11 +1431,14 @@ class LocalTileDelegate(QStyledItemDelegate):
         text_rect = rect.adjusted(10, 0, -10, 0)
         if index.flags() & Qt.ItemFlag.ItemIsUserCheckable:
             text_rect.adjust(0, 0, -18, 0)
-        text = option.fontMetrics.elidedText(text, Qt.TextElideMode.ElideRight, text_rect.width())
-        tile_font = QFont(option.font)
-        tile_font.setPointSize(9)
-        tile_font.setWeight(QFont.Weight.Medium)
-        painter.setFont(tile_font)
+        if LocalTileDelegate._cached_tile_font is None:
+            f = QFont(option.font)
+            f.setPointSize(9)
+            f.setWeight(QFont.Weight.Medium)
+            LocalTileDelegate._cached_tile_font = f
+        fm = QFontMetrics(LocalTileDelegate._cached_tile_font)
+        text = fm.elidedText(text, Qt.TextElideMode.ElideRight, text_rect.width())
+        painter.setFont(LocalTileDelegate._cached_tile_font)
         painter.setPen(QColor("#e2e8f0"))
         painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
 
@@ -1141,10 +1766,20 @@ class FramelessImporterDialog(QDialog):
         self.setWindowFlags(
             Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
         )
-        # Reduce GPU composition artifacts (black/pointy ghost rectangles) on some systems.
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        # Enable true alpha transparency – the ImporterShell's CSS
+        # border-radius handles the visual rounding against a transparent
+        # dialog background with no jagged polygon mask artifacts.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._corner_radius = 28.0
         self._dragging = False
         self._drag_offset = QPoint()
+
+    def _apply_window_mask(self) -> None:
+        # With WA_TranslucentBackground the compositor handles transparency,
+        # so a pixel-aligned QRegion mask is no longer needed (it caused
+        # jagged edges and ghost-rectangle artifacts).
+        self.clearMask()
 
     @staticmethod
     def _is_drag_exempt_widget(widget: QWidget | None) -> bool:
@@ -1181,6 +1816,173 @@ class FramelessImporterDialog(QDialog):
         self._dragging = False
         super().mouseReleaseEvent(event)
 
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._apply_window_mask()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._apply_window_mask()
+        _apply_dwm_rounded_corners(self)
+
+
+class UpdateDialog(QDialog):
+    updateRequested = pyqtSignal()
+
+    def __init__(
+        self,
+        current_version: str,
+        new_version: str,
+        parent: QWidget | None = None,
+        mandatory: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self._busy = False
+        self._mandatory = bool(mandatory)
+        self._allow_close = not self._mandatory
+        self.setObjectName("UpdateDialog")
+        self.setWindowTitle("Update Available")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        if self._mandatory:
+            self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(12)
+
+        title = QLabel("Update Available")
+        title.setObjectName("UpdateTitle")
+        subtitle = QLabel(
+            f"A newer version is available.\nCurrent: {current_version}\nNew: {new_version}"
+        )
+        subtitle.setObjectName("UpdateSubtitle")
+
+        self.status_label = QLabel("Ready to update.")
+        self.status_label.setObjectName("UpdateStatus")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setVisible(False)
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(10)
+        button_row.addStretch(1)
+        self.skip_button = QPushButton("Skip")
+        self.skip_button.setProperty("variant", "secondary")
+        self.update_button = QPushButton("Update")
+        self.update_button.setProperty("variant", "primary")
+        button_row.addWidget(self.skip_button)
+        button_row.addWidget(self.update_button)
+
+        root.addWidget(title)
+        root.addWidget(subtitle)
+        root.addWidget(self.status_label)
+        root.addWidget(self.progress_bar)
+        root.addLayout(button_row)
+
+        self.skip_button.clicked.connect(self.reject)
+        self.update_button.clicked.connect(self.updateRequested.emit)
+        if self._mandatory:
+            self.skip_button.setEnabled(False)
+
+        self.setStyleSheet(
+            """
+            QDialog#UpdateDialog {
+                background: rgba(22, 33, 50, 245);
+                border: 1px solid rgba(148, 163, 184, 44);
+                border-radius: 14px;
+            }
+            QLabel#UpdateTitle {
+                color: #edf3fb;
+                font-size: 18px;
+                font-weight: 600;
+            }
+            QLabel#UpdateSubtitle {
+                color: #c5d4e8;
+                font-size: 13px;
+                line-height: 1.35;
+            }
+            QLabel#UpdateStatus {
+                color: #dbe8f7;
+                font-size: 12px;
+                font-weight: 500;
+            }
+            QProgressBar {
+                background: rgba(11, 21, 36, 220);
+                border: 1px solid rgba(148, 163, 184, 44);
+                border-radius: 8px;
+                min-height: 18px;
+                color: #eaf2fb;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background: #59d7ff;
+                border-radius: 7px;
+            }
+            """
+        )
+
+    def begin_update(self) -> None:
+        self._busy = True
+        self.update_button.setText("Update")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.status_label.setText("Downloading update...")
+        self.update_button.setEnabled(False)
+        self.skip_button.setEnabled(False)
+
+    def set_download_progress(self, downloaded: int, total: int) -> None:
+        self.progress_bar.setVisible(True)
+        if total > 0:
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(max(0, min(total, downloaded)))
+            self.status_label.setText(
+                f"Downloading update... {downloaded / (1024 * 1024):.1f}/{total / (1024 * 1024):.1f} MB"
+            )
+        else:
+            self.progress_bar.setRange(0, 0)
+            self.status_label.setText("Downloading update...")
+
+    def set_extracting(self) -> None:
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.status_label.setText("Extracting update package...")
+
+    def set_installing(self) -> None:
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.status_label.setText("Installing update and relaunching...")
+
+    def finish_success(self) -> None:
+        self._busy = False
+        self._allow_close = True
+
+    def set_error(self, message: str) -> None:
+        self._busy = False
+        self.progress_bar.setVisible(False)
+        self.status_label.setText(f"Update failed: {message}")
+        self.update_button.setText("Retry")
+        self.update_button.setEnabled(True)
+        if self._mandatory:
+            self.skip_button.setEnabled(False)
+        else:
+            self.skip_button.setEnabled(True)
+
+    def reject(self) -> None:  # type: ignore[override]
+        if self._mandatory and not self._allow_close:
+            return
+        super().reject()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._busy or (self._mandatory and not self._allow_close):
+            event.ignore()
+            return
+        super().closeEvent(event)
+
 
 class SoundboardWindow(QMainWindow):
     DEFAULT_KEYS = list("1234567890qwertyuiopasdfghjklzxcvbnm")
@@ -1190,8 +1992,11 @@ class SoundboardWindow(QMainWindow):
     def __init__(self, launched_from_startup: bool = False) -> None:
         super().__init__()
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
-        # Reduce GPU composition artifacts (black/pointy ghost rectangles) on some systems.
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        # Enable true alpha transparency so the compositor renders only the
+        # painted regions. The RoundedContainer's CSS border-radius produces
+        # smooth rounded corners against a truly transparent backdrop.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setWindowTitle("SoundboardEZ")
         self.resize(920, 520)
         self.setMinimumSize(920, 520)
@@ -1204,19 +2009,27 @@ class SoundboardWindow(QMainWindow):
             save_app_state(self._app_state)
         self._initial_soundboard_enabled = self._determine_initial_soundboard_enabled()
 
-        self.sounds_dir = Path("sounds")
+        self.sounds_dir = _resolve_runtime_sounds_dir()
         self._local_all_items: list[str] = []
         self._feed_url = MYINSTANTS_INDEX_URL
         self._feed_page = 0
         self._feed_loading = False
         self._feed_end_reached = False
+        self._feed_request_id = 0
+        self._feed_page_cache: dict[tuple[str, int], list[tuple[str, str]]] = {}
         self._remote_seen_urls: set[str] = set()
         self._feed_play_buttons: dict[str, QPushButton] = {}
+        self._pending_feed_rows: deque[RemoteSoundItem] = deque()
+        self._feed_row_chunk_size = 12
         self._current_preview_url: str | None = None
         self._preview_request_id = 0
         self._threads: list[QThread] = []
         self._workers: list[QObject] = []
         self._fetch_in_progress = False
+        self._route_apply_in_progress = False
+        self._import_progress_dialog: QProgressDialog | None = None
+        self._pending_sound_loads: list[str] = []
+        self._sound_load_in_progress = False
         self._delete_mode = False
         self._trim_mode = False
         self._trim_source_path: Path | None = None
@@ -1224,12 +2037,31 @@ class SoundboardWindow(QMainWindow):
         self._trim_sr = 48000
         self._trim_playing = False
         self._trim_playhead = 0
+        self._trim_decode_request_id = 0
         self._trim_stream: sd.OutputStream | None = None
         self._trim_preview_gain = 0.05
         self._trim_updating_slider = False
         self._fetch_timeout = QTimer(self)
         self._fetch_timeout.setSingleShot(True)
         self._fetch_timeout.timeout.connect(self._handle_fetch_timeout)
+        self._pending_feed_scroll_value = 0
+        self._feed_scroll_debounce = QTimer(self)
+        self._feed_scroll_debounce.setSingleShot(True)
+        self._feed_scroll_debounce.setInterval(80)
+        self._feed_scroll_debounce.timeout.connect(self._load_next_feed_page_if_needed)
+        self._import_search_timer = QTimer(self)
+        self._import_search_timer.setSingleShot(True)
+        self._import_search_timer.setInterval(280)
+        self._import_search_timer.timeout.connect(self._run_debounced_import_search)
+        self._feed_row_render_timer = QTimer(self)
+        self._feed_row_render_timer.setSingleShot(True)
+        self._feed_row_render_timer.setInterval(16)
+        self._feed_row_render_timer.timeout.connect(self._drain_pending_feed_rows)
+        self._local_layout_timer = QTimer(self)
+        self._local_layout_timer.setSingleShot(True)
+        self._local_layout_timer.setInterval(40)
+        self._local_layout_timer.timeout.connect(self._apply_local_layout_refresh)
+        self._last_local_tile_size = QSize()
         self._preview_monitor = QTimer(self)
         self._preview_monitor.setInterval(150)
         self._preview_monitor.timeout.connect(self._check_preview_finished)
@@ -1281,26 +2113,16 @@ class SoundboardWindow(QMainWindow):
         self._engine_thread = threading.Thread(target=self._run_engine, daemon=True)
         self._engine_thread.start()
 
-        central = QWidget()
-        central.setObjectName("WindowBackdrop")
+        central = _WindowBackdrop()
         self.setCentralWidget(central)
         shell_layout = QVBoxLayout(central)
-        shell_layout.setContentsMargins(10, 10, 10, 10)
+        shell_layout.setContentsMargins(12, 12, 12, 12)
         shell_layout.setSpacing(0)
 
-        self.window_shell = QFrame()
-        self.window_shell.setObjectName("Root")
+        self.window_shell = RoundedContainer()
         self.window_shell.setMouseTracking(True)
         shell_layout.addWidget(self.window_shell, 1)
-
-        shadow = QGraphicsDropShadowEffect(self.window_shell)
-        shadow.setBlurRadius(34.0)
-        shadow.setOffset(0.0, 12.0)
-        shadow.setColor(QColor(4, 12, 27, 165))
-        if not self.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground):
-            shadow.setEnabled(False)
-        self.window_shell.setGraphicsEffect(shadow)
-        self._shell_shadow = shadow
+        self._shell_shadow = None  # shadow painted manually in _WindowBackdrop
 
         root_layout = QHBoxLayout(self.window_shell)
         root_layout.setContentsMargins(16, 16, 16, 16)
@@ -1399,17 +2221,21 @@ class SoundboardWindow(QMainWindow):
         self.import_file_btn = QPushButton("Import File")
         self.import_file_btn.setProperty("variant", "primary")
         self.preview_volume_label = QLabel("Preview Volume: 8%")
-        self.preview_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.preview_volume_slider = NoWheelSlider(Qt.Orientation.Horizontal)
         self.preview_volume_slider.setRange(0, 100)
         self.preview_volume_slider.setValue(8)
         self.mic_volume_label = QLabel(f"Mic Volume: {self.DEFAULT_MIC_VOLUME}%")
-        self.mic_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.mic_volume_slider = NoWheelSlider(Qt.Orientation.Horizontal)
         self.mic_volume_slider.setRange(0, 200)
         self.mic_volume_slider.setValue(self.DEFAULT_MIC_VOLUME)
         self.remote_feed_list = SmoothListWidget(slow_factor=0.5)
         self.remote_feed_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.remote_feed_list.setSpacing(16)
         self.remote_feed_list.setMinimumHeight(120)
+        self.remote_feed_list.setUniformItemSizes(True)
+        self.remote_feed_list.setLayoutMode(QListView.LayoutMode.Batched)
+        self.remote_feed_list.setBatchSize(48)
+        self.remote_feed_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
 
         importer_header_row = QHBoxLayout()
         importer_header_row.setContentsMargins(0, 0, 0, 0)
@@ -1476,14 +2302,14 @@ class SoundboardWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(16)
         self.soundboard_volume_label = QLabel(f"Soundboard Volume: {self.DEFAULT_SOUNDBOARD_VOLUME}%")
-        self.soundboard_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.soundboard_volume_slider = NoWheelSlider(Qt.Orientation.Horizontal)
         self.soundboard_volume_slider.setRange(0, 200)
         self.soundboard_volume_slider.setValue(self.DEFAULT_SOUNDBOARD_VOLUME)
         self.speaker_monitor_btn = QPushButton("Play To Speaker: Off")
         self.speaker_monitor_btn.setProperty("variant", "primary")
         self.speaker_monitor_btn.setCheckable(True)
         self.speaker_monitor_label = QLabel("Speaker Volume: 2%")
-        self.speaker_monitor_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speaker_monitor_slider = NoWheelSlider(Qt.Orientation.Horizontal)
         self.speaker_monitor_slider.setRange(0, 100)
         self.speaker_monitor_slider.setValue(2)
         self.speaker_monitor_label.setVisible(False)
@@ -1493,10 +2319,10 @@ class SoundboardWindow(QMainWindow):
         self.device_label = QLabel("Audio Route")
         self.device_label.setObjectName("HintLabel")
         self.mic_device_label = QLabel("Mic Input")
-        self.mic_device_combo = QComboBox()
+        self.mic_device_combo = NoWheelComboBox()
         self.mic_device_combo.setObjectName("RouteCombo")
         self.output_device_label = QLabel("Mix Output")
-        self.output_device_combo = QComboBox()
+        self.output_device_combo = NoWheelComboBox()
         self.output_device_combo.setObjectName("RouteCombo")
         self.refresh_devices_btn = QPushButton("Refresh Devices")
         self.refresh_devices_btn.setProperty("variant", "slate")
@@ -1534,6 +2360,8 @@ class SoundboardWindow(QMainWindow):
         self.local_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.local_list.setMovement(QListView.Movement.Static)
         self.local_list.setUniformItemSizes(True)
+        self.local_list.setLayoutMode(QListView.LayoutMode.Batched)
+        self.local_list.setBatchSize(120)
         self.local_list.setSpacing(12)
         self.local_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.local_list.setWordWrap(True)
@@ -1542,7 +2370,7 @@ class SoundboardWindow(QMainWindow):
         self.local_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.local_list.customContextMenuRequested.connect(self._show_local_context_menu)
         self.local_list.setItemDelegate(LocalTileDelegate(self.local_list))
-        self.local_title = QLabel("Imported Sounds")
+        self.local_title = QLabel("Imported Sounds--ami_nope")
         self.local_title.setObjectName("SectionTitle")
         title_font = QFont(self.local_title.font())
         title_font.setPointSize(22)
@@ -1697,26 +2525,27 @@ class SoundboardWindow(QMainWindow):
         self.importer_window.resize(760, 620)
         self.importer_shell = QWidget()
         self.importer_shell.setObjectName("ImporterShell")
+        self.importer_shell.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         importer_shadow = QGraphicsDropShadowEffect(self.importer_shell)
-        importer_shadow.setBlurRadius(38)
-        importer_shadow.setOffset(0, 14)
-        importer_shadow.setColor(QColor(4, 11, 24, 180))
-        if not self.importer_window.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground):
-            importer_shadow.setEnabled(False)
+        importer_shadow.setBlurRadius(28)
+        importer_shadow.setOffset(0, 8)
+        importer_shadow.setColor(QColor(4, 11, 24, 160))
+        importer_shadow.setEnabled(True)
         self.importer_shell.setGraphicsEffect(importer_shadow)
         importer_shell_layout = QVBoxLayout(self.importer_shell)
         importer_shell_layout.setContentsMargins(20, 20, 20, 20)
         importer_shell_layout.setSpacing(0)
         importer_shell_layout.addWidget(self.left_group)
         importer_window_layout = QVBoxLayout(self.importer_window)
-        importer_window_layout.setContentsMargins(8, 8, 8, 8)
+        # Margins give the rounded corners + drop shadow room to breathe.
+        importer_window_layout.setContentsMargins(16, 12, 16, 20)
         importer_window_layout.setSpacing(0)
         importer_window_layout.addWidget(self.importer_shell)
         self.importer_window.finished.connect(lambda _=0: self._set_importer_visible(False))
 
         self.close_importer_btn.clicked.connect(self.close_importer_panel)
         self.import_search_input.returnPressed.connect(self.apply_import_search)
-        self.import_search_input.textChanged.connect(lambda _=None: self.apply_import_search())
+        self.import_search_input.textChanged.connect(self._schedule_import_search)
         self.fetch_btn.clicked.connect(self.fetch_sounds)
         self.preview_volume_slider.valueChanged.connect(self.update_preview_volume_label)
         self.mic_volume_slider.valueChanged.connect(self.update_mic_volume_label)
@@ -1765,6 +2594,7 @@ class SoundboardWindow(QMainWindow):
         self._sync_startup_tray_state()
         self._update_route_status()
         self._apply_window_mask()
+        _apply_dwm_rounded_corners(self)
         self._run_entrance_animation()
 
     def _run_engine(self) -> None:
@@ -1865,6 +2695,10 @@ class SoundboardWindow(QMainWindow):
         return False, "Audio engine start timed out."
 
     def apply_audio_route(self) -> None:
+        if self._route_apply_in_progress:
+            self.status_label.setText("Route change already in progress...")
+            return
+
         in_dev = self._coerce_device_data(self.mic_device_combo.currentData())
         out_dev = self._coerce_device_data(self.output_device_combo.currentData())
         old_in = self.engine.input_device
@@ -1877,32 +2711,54 @@ class SoundboardWindow(QMainWindow):
 
         self.stop_remote_preview(silent=True)
         self._speaker_player.stop()
-        self.engine.input_device = in_dev
-        self.engine.output_device = out_dev
-        ok, err = self._restart_audio_engine()
-        if ok:
-            self._aux_output_cache_deadline = 0.0
-            msg = "Audio route applied."
-            self.status_label.setText(msg)
-            self._notify_desktop(msg, title="Audio Route")
-            self._update_route_status()
-            return
+        self._route_apply_in_progress = True
+        self.apply_devices_btn.setEnabled(False)
+        self.status_label.setText("Applying audio route...")
 
-        self.engine.input_device = old_in
-        self.engine.output_device = old_out
-        rollback_ok, rollback_err = self._restart_audio_engine()
-        if rollback_ok:
-            self._aux_output_cache_deadline = 0.0
-            msg = f"Route failed ({err}). Reverted to previous route."
+        worker = RouteApplyWorker(
+            engine=self.engine,
+            restart_fn=self._restart_audio_engine,
+            input_device=in_dev,
+            output_device=out_dev,
+            old_input_device=old_in,
+            old_output_device=old_out,
+        )
+
+        def done(result: dict) -> None:
+            self._route_apply_in_progress = False
+            self.apply_devices_btn.setEnabled(True)
+            if bool(result.get("ok")):
+                self._aux_output_cache_deadline = 0.0
+                msg = "Audio route applied."
+                self.status_label.setText(msg)
+                self._notify_desktop(msg, title="Audio Route")
+                self._update_route_status()
+                return
+
+            err = result.get("err")
+            rollback_ok = bool(result.get("rollback_ok"))
+            rollback_err = result.get("rollback_err")
+            if rollback_ok:
+                self._aux_output_cache_deadline = 0.0
+                msg = f"Route failed ({err}). Reverted to previous route."
+                self.status_label.setText(msg)
+                self._notify_desktop(msg, title="Audio Route", error=True)
+                self._update_route_status()
+                return
+
+            msg = f"Route failed ({err}). Restore failed ({rollback_err})."
             self.status_label.setText(msg)
             self._notify_desktop(msg, title="Audio Route", error=True)
             self._update_route_status()
-            return
 
-        msg = f"Route failed ({err}). Restore failed ({rollback_err})."
-        self.status_label.setText(msg)
-        self._notify_desktop(msg, title="Audio Route", error=True)
-        self._update_route_status()
+        def err(message: str) -> None:
+            self._route_apply_in_progress = False
+            self.apply_devices_btn.setEnabled(True)
+            self.status_label.setText(f"Route failed: {message}")
+            self._notify_desktop(self.status_label.text(), title="Audio Route", error=True)
+            self._update_route_status()
+
+        self._run_worker(worker, done, err)
 
     def _apply_button_ratios(self) -> None:
         sidebar_buttons = [
@@ -1954,11 +2810,11 @@ class SoundboardWindow(QMainWindow):
             QWidget#WindowBackdrop {
                 background: transparent;
             }
-            QFrame#Root {
+            QFrame#RoundedContainer {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                     stop:0 #111f33,
                     stop:1 #152a44);
-                border: 1px solid rgba(157, 179, 208, 44);
+                border: none;
                 border-radius: 22px;
                 color: #e7edf7;
                 font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", sans-serif;
@@ -1973,7 +2829,7 @@ class SoundboardWindow(QMainWindow):
             }
             QWidget#ImporterShell {
                 background: rgba(19, 33, 52, 236);
-                border: 1px solid rgba(168, 187, 214, 34);
+                border: none;
                 border-radius: 28px;
             }
             QFrame#TopBar {
@@ -2290,6 +3146,34 @@ class SoundboardWindow(QMainWindow):
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0px;
             }
+            QPushButton#FeedButton {
+                border-radius: 12px;
+                border: 1px solid rgba(148, 163, 184, 52);
+                font-size: 13px;
+                font-weight: 600;
+                min-height: 0px;
+                max-height: 32px;
+                padding: 0px 10px;
+                color: #eaf2fb;
+                background: rgba(64, 82, 108, 220);
+            }
+            QPushButton#FeedButton:hover {
+                background: rgba(81, 101, 130, 230);
+                border-color: rgba(96, 214, 255, 188);
+            }
+            QPushButton#FeedButton:pressed {
+                background: rgba(58, 77, 102, 235);
+            }
+            QPushButton#FeedButton[active="true"] {
+                background: #0f6f98;
+                border-color: #62d6ff;
+                color: #f7fbff;
+            }
+            QPushButton#FeedButton:disabled {
+                background: rgba(27, 39, 58, 220);
+                border-color: rgba(71, 85, 105, 120);
+                color: #8fa5c1;
+            }
             """
         )
 
@@ -2305,7 +3189,6 @@ class SoundboardWindow(QMainWindow):
             self.app_subtitle,
             self.status_label,
             self.route_status_label,
-            self.window_controls,
         ]
         for widget in drag_widgets:
             if widget in self._window_drag_widgets:
@@ -2439,21 +3322,10 @@ class SoundboardWindow(QMainWindow):
     def _apply_window_mask(self) -> None:
         if not hasattr(self, "window_shell"):
             return
-        if self.isMaximized():
-            self.window_shell.clearMask()
-            return
-        # On some Windows DPI scale factors, widget masks clip in physical-pixel
-        # coordinates and can truncate the visible window. Keep rounded shell
-        # styling and skip explicit masking in that mode.
-        if self.devicePixelRatioF() > 1.01:
-            self.window_shell.clearMask()
-            return
-        rect = QRectF(self.window_shell.rect())
-        if rect.width() <= 2 or rect.height() <= 2:
-            return
-        path = self._build_squircle_path(rect.adjusted(0.5, 0.5, -0.5, -0.5), self._window_corner_radius)
-        region = QRegion(path.toFillPolygon().toPolygon())
-        self.window_shell.setMask(region)
+        # Keep native rectangular window for stable GPU composition and hit-testing.
+        # Rounded visuals are handled by the styled RoundedContainer.
+        self.clearMask()
+        self.window_shell.clearMask()
 
     def eventFilter(self, obj, event) -> bool:  # type: ignore[override]
         if obj is self.window_shell:
@@ -2535,6 +3407,10 @@ class SoundboardWindow(QMainWindow):
             anim.setStartValue(0.0)
             anim.setEndValue(1.0)
             anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            # Remove the QGraphicsOpacityEffect once the animation finishes
+            # so the widget no longer needs off-screen compositing.
+            w_ref = widget
+            anim.finished.connect(lambda w=w_ref: w.setGraphicsEffect(None))
             self._ui_animations.append(anim)
             QTimer.singleShot(start_ms, anim.start)
 
@@ -2750,17 +3626,22 @@ class SoundboardWindow(QMainWindow):
         )
 
     def _resolve_aux_output_device(self, force_refresh: bool = False) -> int | None:
+        """Return the system's current default output device index.
+
+        This is used for preview playback and Play-to-Speaker — it should
+        always honour the OS-level default so the user hears audio on
+        whichever device they have selected in Windows Sound settings.
+        """
         now = time.monotonic()
         if not force_refresh and now < self._aux_output_cache_deadline:
             return self._aux_output_device_cache
 
         default_out: int | None = None
         try:
-            defaults = sd.default.device
-            if defaults is not None and len(defaults) > 1 and defaults[1] is not None:
-                candidate = int(defaults[1])
-                if candidate >= 0:
-                    default_out = candidate
+            defaults = sd.default.device          # _InputOutputPair
+            candidate = int(defaults[1])           # output index
+            if candidate >= 0:
+                default_out = candidate
         except Exception:
             default_out = None
 
@@ -2768,13 +3649,13 @@ class SoundboardWindow(QMainWindow):
             try:
                 dev = sd.query_devices(default_out)
                 if int(dev.get("max_output_channels", 0)) > 0:
-                    if not self._is_virtual_cable_output_name(str(dev.get("name", ""))):
-                        self._aux_output_device_cache = default_out
-                        self._aux_output_cache_deadline = now + 6.0
-                        return default_out
+                    self._aux_output_device_cache = default_out
+                    self._aux_output_cache_deadline = now + 6.0
+                    return default_out
             except Exception:
                 pass
 
+        # Fallback: pick any real output device if no default is set.
         candidates: list[tuple[int, int, int]] = []
         try:
             devices = sd.query_devices()
@@ -2788,8 +3669,7 @@ class SoundboardWindow(QMainWindow):
                 continue
             host_name = self.engine._hostapi_name(int(dev.get("hostapi", 0)))
             host_priority = self.engine._hostapi_priority(host_name)
-            default_penalty = 0 if default_out is not None and idx == default_out else 1
-            candidates.append((default_penalty, host_priority, idx))
+            candidates.append((host_priority, idx))
 
         if not candidates:
             self._aux_output_device_cache = None
@@ -2797,12 +3677,12 @@ class SoundboardWindow(QMainWindow):
             return None
 
         candidates.sort()
-        chosen = int(candidates[0][2])
+        chosen = int(candidates[0][1])
         self._aux_output_device_cache = chosen
         self._aux_output_cache_deadline = now + 6.0
         return chosen
 
-    def _run_worker(self, worker: QObject, on_finished, on_error) -> None:
+    def _run_worker(self, worker: QObject, on_finished, on_error, on_progress=None) -> None:
         thread = QThread()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -2823,8 +3703,21 @@ class SoundboardWindow(QMainWindow):
                 self._notify_desktop(str(exc), title="Worker Error", error=True)
                 print(f"Worker error handler error: {exc}")
 
+        def safe_progress(*args):
+            if on_progress is None:
+                return
+            try:
+                on_progress(*args)
+            except Exception as exc:
+                print(f"Worker progress handler error: {exc}")
+
         worker.finished.connect(safe_finished)
         worker.error.connect(safe_error)
+        if on_progress is not None and hasattr(worker, "progress"):
+            try:
+                worker.progress.connect(safe_progress)  # type: ignore[attr-defined]
+            except Exception:
+                pass
         worker.finished.connect(worker.deleteLater)
         worker.error.connect(worker.deleteLater)
         worker.finished.connect(thread.quit)
@@ -2856,6 +3749,9 @@ class SoundboardWindow(QMainWindow):
             self.importer_window.raise_()
             self.importer_window.activateWindow()
         else:
+            self._import_search_timer.stop()
+            self._feed_row_render_timer.stop()
+            self._pending_feed_rows.clear()
             self.importer_window.hide()
         self.toggle_importer_btn.setText("Close Importer" if visible else "Open Importer")
         if visible and not self._importer_loaded_once:
@@ -2866,16 +3762,94 @@ class SoundboardWindow(QMainWindow):
         self._set_importer_visible(not self.importer_window.isVisible())
 
     def close_importer_panel(self) -> None:
+        self._import_search_timer.stop()
         self._set_importer_visible(False)
 
+    def _schedule_import_search(self, _text: str) -> None:
+        if not self.importer_window.isVisible():
+            return
+        self._import_search_timer.start()
+
+    def _run_debounced_import_search(self) -> None:
+        if not self.importer_window.isVisible():
+            return
+        self.apply_import_search()
+
     def apply_import_search(self) -> None:
-        raw = self.import_search_input.text().strip()
-        if not raw:
-            resolved = MYINSTANTS_INDEX_URL
-        else:
-            resolved = f"https://www.myinstants.com/en/search/?name={quote_plus(raw)}"
-        self._feed_url = resolved
+        self._import_search_timer.stop()
         self.fetch_sounds()
+
+    def _begin_import_progress(self, title: str, total_items: int = 0) -> None:
+        if self._import_progress_dialog is not None:
+            try:
+                self._import_progress_dialog.close()
+            except Exception:
+                pass
+            self._import_progress_dialog.deleteLater()
+            self._import_progress_dialog = None
+
+        dialog = QProgressDialog("Preparing import...", None, 0, 100, self)
+        dialog.setWindowTitle(title)
+        dialog.setCancelButton(None)
+        # Use NonModal so the main window stays responsive and doesn't
+        # trigger black-border / "not responding" artifacts on Windows.
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        dialog.show()
+        self._import_progress_dialog = dialog
+
+    def _end_import_progress(self) -> None:
+        dialog = self._import_progress_dialog
+        self._import_progress_dialog = None
+        if dialog is None:
+            return
+        try:
+            dialog.close()
+        except Exception:
+            pass
+        dialog.deleteLater()
+
+    def _on_import_progress(self, payload: object) -> None:
+        dialog = self._import_progress_dialog
+        if dialog is None or not isinstance(payload, dict):
+            return
+        phase = str(payload.get("phase", "")).strip().lower()
+        item_name = str(payload.get("item_name", "")).strip()
+        item_index = int(payload.get("item_index", 0) or 0)
+        total_items = int(payload.get("total_items", 0) or 0)
+        downloaded = payload.get("downloaded_bytes")
+        total = payload.get("total_bytes")
+
+        if phase in {"download", "copy"}:
+            verb = "Importing" if phase == "copy" else "Downloading"
+            if isinstance(total, int) and total > 0 and isinstance(downloaded, int):
+                dialog.setRange(0, total)
+                dialog.setValue(max(0, min(total, int(downloaded))))
+                label = (
+                    f"{verb} {item_name} ({item_index}/{max(1, total_items)}) "
+                    f"{int(downloaded) / (1024 * 1024):.1f}/{int(total) / (1024 * 1024):.1f} MB"
+                )
+                dialog.setLabelText(label)
+            else:
+                dialog.setRange(0, 0)
+                dialog.setLabelText(
+                    f"{verb} {item_name} ({item_index}/{max(1, total_items)})..."
+                )
+            return
+
+        if phase == "cache":
+            dialog.setRange(0, max(1, total_items))
+            dialog.setValue(max(0, min(int(item_index), max(1, total_items))))
+            dialog.setLabelText(f"Loading {item_name} ({item_index}/{max(1, total_items)})...")
+            return
+
+        if phase == "item-start":
+            dialog.setRange(0, 0)
+            dialog.setLabelText(f"Preparing {item_name} ({item_index}/{max(1, total_items)})...")
+            return
 
     def import_from_link(self) -> None:
         raw = self.import_search_input.text().strip()
@@ -2891,6 +3865,7 @@ class SoundboardWindow(QMainWindow):
         if "youtube.com" in host or "youtu.be" in host:
             self.status_label.setText("Importing YouTube (first 5 seconds)...")
             worker = YoutubeImportWorker(raw, self.sounds_dir, clip_seconds=5.0)
+            self._begin_import_progress("Importing YouTube", total_items=1)
             self._run_worker(worker, self._on_import_done, self._on_import_error)
             return
 
@@ -2901,13 +3876,13 @@ class SoundboardWindow(QMainWindow):
                 return
             name = Path(parsed.path).stem or "myinstants_sound"
             worker = ImportWorker([RemoteSoundItem(name=name, url=audio_url)], self.sounds_dir)
-            self._run_worker(worker, self._on_import_done, self._on_import_error)
+            self._begin_import_progress("Importing Sound", total_items=1)
+            self._run_worker(worker, self._on_import_done, self._on_import_error, on_progress=self._on_import_progress)
             return
 
         self.status_label.setText("Only YouTube and myinstants links are supported.")
 
     def import_from_file_dialog(self) -> None:
-        self.sounds_dir.mkdir(parents=True, exist_ok=True)
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Import Audio Files",
@@ -2916,40 +3891,35 @@ class SoundboardWindow(QMainWindow):
         )
         if not files:
             return
-
-        imported: list[str] = []
-        skipped: list[str] = []
-        existing_basenames = {p.stem.lower() for p in self.sounds_dir.iterdir() if p.is_file()}
-        for src_str in files:
-            src = Path(src_str)
-            if not src.exists():
-                skipped.append(f"{src.name} (missing)")
-                continue
-            base = _safe_name(src.stem)
-            if base.lower() in existing_basenames:
-                skipped.append(f"{src.name} (duplicate name)")
-                continue
-            dst = self.sounds_dir / f"{base}{src.suffix.lower()}"
-            try:
-                shutil.copy2(src, dst)
-                imported.append(str(dst))
-                existing_basenames.add(base.lower())
-            except Exception as exc:
-                skipped.append(f"{src.name} ({exc})")
-
-        self._finalize_import(imported, skipped)
+        self.status_label.setText(f"Importing {len(files)} local file(s)...")
+        worker = FileImportWorker(files, self.sounds_dir)
+        self._begin_import_progress("Importing Files", total_items=len(files))
+        self._run_worker(worker, self._on_import_done, self._on_import_error, on_progress=self._on_import_progress)
 
     def fetch_sounds(self) -> None:
-        raw = self.import_search_input.text().strip() or MYINSTANTS_INDEX_URL
+        raw_input = self.import_search_input.text().strip()
+        raw = raw_input or MYINSTANTS_INDEX_URL
         url, error = _resolve_myinstants_feed_url(raw)
         if error or url is None:
             self.status_label.setText(error or "Invalid URL.")
             return
-        self.import_search_input.setText(url)
 
+        # Keep the importer field as a simple search box for plain-text queries.
+        # Only normalize the UI text when the user entered a direct URL.
+        if raw_input.startswith(("http://", "https://")) and raw_input != url:
+            blocked = self.import_search_input.blockSignals(True)
+            self.import_search_input.setText(url)
+            self.import_search_input.blockSignals(blocked)
+
+        self._feed_request_id += 1
         self._feed_url = url
         self._feed_page = 0
+        self._feed_loading = False
+        self._fetch_in_progress = False
         self._feed_end_reached = False
+        self._fetch_timeout.stop()
+        self._feed_row_render_timer.stop()
+        self._pending_feed_rows.clear()
         self._remote_seen_urls.clear()
         self._feed_play_buttons.clear()
         self.remote_feed_list.clear()
@@ -2961,18 +3931,30 @@ class SoundboardWindow(QMainWindow):
 
         next_page = self._feed_page + 1
         notify_completion = next_page == 1
+        request_id = int(self._feed_request_id)
         self._feed_loading = True
         self._fetch_in_progress = True
         self._fetch_timeout.start(20000)
         self.fetch_btn.setEnabled(False)
         self.status_label.setText(f"Loading sounds page {next_page}...")
+        cache_key = (self._feed_url, next_page)
         worker = FetchWorker(self._feed_url, next_page)
 
         def done(rows: list[tuple[str, str]]) -> None:
+            if request_id != self._feed_request_id:
+                return
             self._fetch_in_progress = False
             self._feed_loading = False
             self._fetch_timeout.stop()
             self.fetch_btn.setEnabled(True)
+            self._feed_page_cache[cache_key] = list(rows)
+            if len(self._feed_page_cache) > 160:
+                try:
+                    oldest_key = next(iter(self._feed_page_cache))
+                    if oldest_key != cache_key:
+                        self._feed_page_cache.pop(oldest_key, None)
+                except Exception:
+                    pass
             if not rows:
                 if next_page == 1:
                     self.status_label.setText("No sounds found on this page URL.")
@@ -2983,13 +3965,17 @@ class SoundboardWindow(QMainWindow):
                     self._notify_desktop(self.status_label.text(), title="Feed Load")
                 return
 
-            added = 0
+            new_rows: list[RemoteSoundItem] = []
             for name, url in rows:
                 if url in self._remote_seen_urls:
                     continue
                 self._remote_seen_urls.add(url)
-                self._add_feed_row(RemoteSoundItem(name=name, url=url))
-                added += 1
+                new_rows.append(RemoteSoundItem(name=name, url=url))
+            added = len(new_rows)
+            if added:
+                self._pending_feed_rows.extend(new_rows)
+                if not self._feed_row_render_timer.isActive():
+                    self._feed_row_render_timer.start()
 
             self._feed_page = next_page
             if added == 0:
@@ -3001,6 +3987,8 @@ class SoundboardWindow(QMainWindow):
                 self._notify_desktop(self.status_label.text(), title="Feed Load")
 
         def err(message: str) -> None:
+            if request_id != self._feed_request_id:
+                return
             self._fetch_in_progress = False
             self._feed_loading = False
             self._fetch_timeout.stop()
@@ -3010,6 +3998,11 @@ class SoundboardWindow(QMainWindow):
             if notify_completion:
                 self._notify_desktop(friendly, title="Feed Load", error=True)
             print(f"Feed load error: {message}")
+
+        cached_rows = self._feed_page_cache.get(cache_key)
+        if cached_rows is not None:
+            QTimer.singleShot(0, lambda rows=list(cached_rows): done(rows))
+            return
 
         self._run_worker(worker, done, err)
 
@@ -3034,11 +4027,29 @@ class SoundboardWindow(QMainWindow):
         return "Feed load failed. Please retry."
 
     def _on_feed_scroll(self, value: int) -> None:
+        self._pending_feed_scroll_value = int(value)
+        if not self._feed_scroll_debounce.isActive():
+            self._feed_scroll_debounce.start()
+
+    def _load_next_feed_page_if_needed(self) -> None:
         bar = self.remote_feed_list.verticalScrollBar()
         if bar.maximum() <= 0:
             return
-        if value >= bar.maximum() - 80:
+        if int(self._pending_feed_scroll_value) >= bar.maximum() - 80:
             self._load_next_feed_page()
+
+    def _drain_pending_feed_rows(self) -> None:
+        if not self._pending_feed_rows:
+            return
+        self.remote_feed_list.setUpdatesEnabled(False)
+        try:
+            count = min(int(self._feed_row_chunk_size), len(self._pending_feed_rows))
+            for _ in range(count):
+                self._add_feed_row(self._pending_feed_rows.popleft())
+        finally:
+            self.remote_feed_list.setUpdatesEnabled(True)
+        if self._pending_feed_rows:
+            self._feed_row_render_timer.start()
 
     def _add_feed_row(self, item: RemoteSoundItem) -> None:
         row_item = QListWidgetItem()
@@ -3053,10 +4064,12 @@ class SoundboardWindow(QMainWindow):
         name_lbl.setObjectName("FeedNameLabel")
         name_lbl.setToolTip(item.url)
         play_btn = QPushButton("Play")
+        play_btn.setObjectName("FeedButton")
         play_btn.setMinimumHeight(32)
         play_btn.setMinimumWidth(78)
         play_btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         import_btn = QPushButton("Import")
+        import_btn.setObjectName("FeedButton")
         import_btn.setMinimumHeight(32)
         import_btn.setMinimumWidth(102)
         import_btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
@@ -3076,40 +4089,8 @@ class SoundboardWindow(QMainWindow):
 
     def _style_feed_buttons(self, play_btn: QPushButton, import_btn: QPushButton, seed: str) -> None:
         _ = seed
-        feed_button_style = """
-            QPushButton {
-                border-radius: 12px;
-                border: 1px solid rgba(148, 163, 184, 52);
-                font-size: 13px;
-                font-weight: 600;
-                min-height: 0px;
-                max-height: 32px;
-                padding: 0px 10px;
-                color: #eaf2fb;
-                background: rgba(64, 82, 108, 220);
-            }
-            QPushButton:hover {
-                background: rgba(81, 101, 130, 230);
-                border-color: rgba(96, 214, 255, 188);
-            }
-            QPushButton:pressed {
-                background: rgba(58, 77, 102, 235);
-            }
-            QPushButton[active="true"] {
-                background: #0f6f98;
-                border-color: #62d6ff;
-                color: #f7fbff;
-            }
-            QPushButton:disabled {
-                background: rgba(27, 39, 58, 220);
-                border-color: rgba(71, 85, 105, 120);
-                color: #8fa5c1;
-            }
-            """
         play_btn.setProperty("active", False)
         import_btn.setProperty("active", False)
-        play_btn.setStyleSheet(feed_button_style)
-        import_btn.setStyleSheet(feed_button_style)
 
     def toggle_remote_play(self, item: RemoteSoundItem) -> None:
         if self._current_preview_url == item.url:
@@ -3132,37 +4113,48 @@ class SoundboardWindow(QMainWindow):
             data = payload  # type: ignore[assignment]
             try:
                 remote_item = data["item"]
-                audio = np.array(data["audio"], dtype=np.float32, copy=True, order="C")
+                audio = np.asarray(data["audio"], dtype=np.float32)
                 sr = data["sr"]
                 if audio.ndim == 1:
                     audio = audio.reshape(-1, 1)
                 elif audio.ndim > 2:
                     audio = audio.reshape(audio.shape[0], -1)
-                audio = np.ascontiguousarray(audio, dtype=np.float32)
+                if not audio.flags["C_CONTIGUOUS"]:
+                    audio = np.ascontiguousarray(audio, dtype=np.float32)
                 if audio.shape[0] == 0 or audio.shape[1] == 0:
                     raise RuntimeError("Preview audio is empty.")
-
-                device = self._resolve_aux_output_device()
-                if device is None:
-                    raise RuntimeError("No non-virtual speaker output device is available for preview.")
-                try:
-                    self._preview_player.play(audio, samplerate=sr, device=device)
-                except Exception:
-                    device = self._resolve_aux_output_device(force_refresh=True)
-                    if device is None:
-                        raise RuntimeError("No non-virtual speaker output device is available for preview.")
-                    self._preview_player.play(audio, samplerate=sr, device=device)
             except Exception as exc:
                 self._reset_feed_play_buttons()
                 self.status_label.setText("Preview failed.")
                 QMessageBox.warning(self, "Preview Error", str(exc))
                 return
 
-            self._current_preview_url = remote_item.url
-            self._reset_feed_play_buttons()
-            self._set_feed_play_button(remote_item.url, "Stop", enabled=True)
-            self._preview_monitor.start()
-            self.status_label.setText(f"Previewing '{remote_item.name}'.")
+            # Resolve device + open stream entirely off the UI thread.
+            # sd.query_devices() and Pa_OpenStream can block for seconds.
+            preview_item = remote_item
+            preview_audio = audio
+            preview_sr = sr
+
+            def _start_preview_playback() -> None:
+                try:
+                    device = self._resolve_aux_output_device()
+                    if device is None:
+                        raise RuntimeError("No non-virtual speaker output device is available for preview.")
+                    try:
+                        self._preview_player.play(preview_audio, samplerate=preview_sr, device=device)
+                    except Exception:
+                        device = self._resolve_aux_output_device(force_refresh=True)
+                        if device is None:
+                            raise RuntimeError("No non-virtual speaker output device is available for preview.")
+                        self._preview_player.play(preview_audio, samplerate=preview_sr, device=device)
+                except Exception as exc:
+                    # Schedule UI updates back on the main thread.
+                    QTimer.singleShot(0, lambda: self._on_preview_play_failed(str(exc)))
+                    return
+                # Schedule UI updates back on the main thread.
+                QTimer.singleShot(0, lambda: self._on_preview_play_started(preview_item))
+
+            threading.Thread(target=_start_preview_playback, daemon=True).start()
 
         def err(message: str) -> None:
             if request_id != self._preview_request_id:
@@ -3182,20 +4174,51 @@ class SoundboardWindow(QMainWindow):
         if not silent:
             self.status_label.setText("Preview stopped.")
 
+    def _on_preview_play_started(self, remote_item: RemoteSoundItem) -> None:
+        """Called on the UI thread after background preview playback begins."""
+        self._current_preview_url = remote_item.url
+        self._reset_feed_play_buttons()
+        self._set_feed_play_button(remote_item.url, "Stop", enabled=True)
+        self._preview_monitor.start()
+        self.status_label.setText(f"Previewing '{remote_item.name}'.")
+
+    def _on_preview_play_failed(self, message: str) -> None:
+        """Called on the UI thread when background preview playback fails."""
+        self._reset_feed_play_buttons()
+        self.status_label.setText("Preview failed.")
+        QMessageBox.warning(self, "Preview Error", message)
+
     def _set_feed_play_button(self, url: str, text: str, enabled: bool = True) -> None:
         btn = self._feed_play_buttons.get(url)
         if btn is not None:
-            btn.setText(text)
-            btn.setEnabled(enabled)
-            btn.setProperty("active", text.strip().lower() == "stop")
-            self._refresh_dynamic_button_style(btn)
+            active = text.strip().lower() == "stop"
+            changed = False
+            if btn.text() != text:
+                btn.setText(text)
+                changed = True
+            if btn.isEnabled() != bool(enabled):
+                btn.setEnabled(bool(enabled))
+                changed = True
+            if bool(btn.property("active")) != active:
+                btn.setProperty("active", active)
+                changed = True
+            if changed:
+                self._refresh_dynamic_button_style(btn)
 
     def _reset_feed_play_buttons(self) -> None:
         for btn in self._feed_play_buttons.values():
-            btn.setText("Play")
-            btn.setEnabled(True)
-            btn.setProperty("active", False)
-            self._refresh_dynamic_button_style(btn)
+            changed = False
+            if btn.text() != "Play":
+                btn.setText("Play")
+                changed = True
+            if not btn.isEnabled():
+                btn.setEnabled(True)
+                changed = True
+            if bool(btn.property("active")):
+                btn.setProperty("active", False)
+                changed = True
+            if changed:
+                self._refresh_dynamic_button_style(btn)
 
     @staticmethod
     def _refresh_dynamic_button_style(button: QPushButton) -> None:
@@ -3218,10 +4241,42 @@ class SoundboardWindow(QMainWindow):
             self.status_label.setText("Preview finished.")
 
     def import_remote_item(self, item: RemoteSoundItem) -> None:
+        # Queue imports instead of spawning a new worker per click.
+        if not hasattr(self, "_import_queue"):
+            self._import_queue: deque[RemoteSoundItem] = deque()
+            self._import_running = False
+        self._import_queue.append(item)
+        if self._import_running:
+            self.status_label.setText(f"Queued '{item.name}' for import...")
+            return
+        self._drain_import_queue()
+
+    def _drain_import_queue(self) -> None:
+        if not self._import_queue:
+            self._import_running = False
+            return
+        item = self._import_queue.popleft()
+        self._import_running = True
         self.stop_remote_preview(silent=True)
         self.status_label.setText(f"Importing '{item.name}'...")
         worker = ImportWorker([item], self.sounds_dir)
-        self._run_worker(worker, self._on_import_done, self._on_import_error)
+        self._begin_import_progress("Importing Sound", total_items=1)
+        self._run_worker(worker, self._on_import_done_queued, self._on_import_error_queued, on_progress=self._on_import_progress)
+
+    def _on_import_done_queued(self, result: dict) -> None:
+        self._end_import_progress()
+        imported = result.get("imported", [])
+        skipped = result.get("skipped", [])
+        self._finalize_import(imported, skipped)
+        # Process next item in queue
+        QTimer.singleShot(0, self._drain_import_queue)
+
+    def _on_import_error_queued(self, message: str) -> None:
+        self._end_import_progress()
+        self.status_label.setText("Import failed.")
+        self._notify_desktop(f"Import failed: {message}", title="Import", error=True)
+        # Continue with next item in queue
+        QTimer.singleShot(0, self._drain_import_queue)
 
     def _handle_fetch_timeout(self) -> None:
         if not self._fetch_in_progress:
@@ -3233,18 +4288,23 @@ class SoundboardWindow(QMainWindow):
         self._notify_desktop(self.status_label.text(), title="Feed Load", error=True)
 
     def _on_import_done(self, result: dict) -> None:
+        self._end_import_progress()
         imported = result.get("imported", [])
         skipped = result.get("skipped", [])
         self._finalize_import(imported, skipped)
 
     def _on_import_error(self, message: str) -> None:
+        self._end_import_progress()
         self.status_label.setText("Import failed.")
         self._notify_desktop(f"Import failed: {message}", title="Import", error=True)
         QMessageBox.critical(self, "Import Error", message)
 
     def _finalize_import(self, imported: list[str], skipped: list[str]) -> None:
-        self.refresh_local()
-        self._register_new_sounds(imported)
+        # Incremental append: add only the new files to the local list
+        # instead of rebuilding the entire grid each time.
+        if imported:
+            self._append_imported_to_local(imported)
+        self._queue_sound_load(imported)
         if imported:
             self.status_label.setText(f"Imported {len(imported)} sound(s).")
             self._notify_desktop(self.status_label.text(), title="Import")
@@ -3256,17 +4316,44 @@ class SoundboardWindow(QMainWindow):
             self._notify_desktop(self.status_label.text(), title="Import")
 
     def _register_new_sounds(self, imported_paths: list[str]) -> None:
+        self._queue_sound_load(imported_paths)
+
+    def _queue_sound_load(self, imported_paths: list[str]) -> None:
         if not imported_paths:
             return
-
         for path_str in imported_paths:
-            path = Path(path_str)
-            name = path.stem
-            try:
-                self.engine.soundboard.load_audio_file(name, path)
-            except Exception as exc:
-                print(f"Failed to load imported sound '{name}': {exc}")
+            text = str(path_str).strip()
+            if not text:
                 continue
+            if text not in self._pending_sound_loads:
+                self._pending_sound_loads.append(text)
+        if self._sound_load_in_progress:
+            return
+        self._start_next_sound_load_batch()
+
+    def _start_next_sound_load_batch(self) -> None:
+        if self._sound_load_in_progress or not self._pending_sound_loads:
+            return
+        batch = list(self._pending_sound_loads)
+        self._pending_sound_loads.clear()
+        worker = SoundLoadWorker(self.engine, batch)
+        self._sound_load_in_progress = True
+
+        def done(result: dict) -> None:
+            self._sound_load_in_progress = False
+            failed = result.get("failed", [])
+            if failed:
+                print(f"Sound cache load issues: {failed[0]}")
+            if self._pending_sound_loads:
+                self._start_next_sound_load_batch()
+
+        def err(message: str) -> None:
+            self._sound_load_in_progress = False
+            print(f"Sound cache load error: {message}")
+            if self._pending_sound_loads:
+                self._start_next_sound_load_batch()
+
+        self._run_worker(worker, done, err, on_progress=self._on_import_progress)
 
     def refresh_local(self) -> None:
         self.sounds_dir.mkdir(parents=True, exist_ok=True)
@@ -3277,22 +4364,57 @@ class SoundboardWindow(QMainWindow):
         self._update_local_grid_size()
         self.apply_local_filter()
 
+    def _append_imported_to_local(self, imported: list[str]) -> None:
+        """Incrementally add newly-imported files to the local grid without
+        clearing and rebuilding the entire list.  Falls back to a full
+        ``refresh_local()`` when a search filter is active."""
+        query = self.local_search_input.text().strip().lower()
+        tile_w, tile_h, _ = self._compute_local_tile_metrics()
+        added = 0
+        self.local_list.setUpdatesEnabled(False)
+        try:
+            for path_str in imported:
+                name = Path(path_str).name
+                if name in self._local_all_items:
+                    continue
+                self._local_all_items.append(name)
+                if query and query not in name.lower():
+                    continue
+                visual_idx = self.local_list.count()
+                item = QListWidgetItem(name)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setSizeHint(QSize(tile_w, tile_h))
+                self._style_local_tile(item, visual_idx)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Unchecked)
+                self.local_list.addItem(item)
+                added += 1
+        finally:
+            self.local_list.setUpdatesEnabled(True)
+        if added:
+            self._update_local_grid_size()
+
     def apply_local_filter(self, _text: str | None = None) -> None:
         query = self.local_search_input.text().strip().lower()
-        self.local_list.clear()
         tile_w, tile_h, _ = self._compute_local_tile_metrics()
+        self.local_list.setUpdatesEnabled(False)
+        self.local_list.clear()
         visual_idx = 0
-        for name in self._local_all_items:
-            if query and query not in name.lower():
-                continue
-            item = QListWidgetItem(name)
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            item.setSizeHint(QSize(tile_w, tile_h))
-            self._style_local_tile(item, visual_idx)
-            visual_idx += 1
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
-            self.local_list.addItem(item)
+        try:
+            for name in self._local_all_items:
+                if query and query not in name.lower():
+                    continue
+                item = QListWidgetItem(name)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setSizeHint(QSize(tile_w, tile_h))
+                self._style_local_tile(item, visual_idx)
+                visual_idx += 1
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Unchecked)
+                self.local_list.addItem(item)
+        finally:
+            self.local_list.setUpdatesEnabled(True)
+        self._last_local_tile_size = QSize(tile_w, tile_h)
         if self._delete_mode:
             self._set_delete_checkboxes(True)
 
@@ -3351,19 +4473,29 @@ class SoundboardWindow(QMainWindow):
 
     def _update_local_grid_size(self) -> None:
         tile_w, tile_h, spacing = self._compute_local_tile_metrics()
-        self.local_list.setGridSize(QSize(tile_w + spacing, tile_h + spacing))
+        grid_size = QSize(tile_w + spacing, tile_h + spacing)
+        if self.local_list.gridSize() != grid_size:
+            self.local_list.setGridSize(grid_size)
         visible_rows = 4
         min_height = (tile_h * visible_rows) + (spacing * (visible_rows - 1)) + 32
-        self.local_list.setMinimumHeight(min_height)
+        if self.local_list.minimumHeight() != min_height:
+            self.local_list.setMinimumHeight(min_height)
         self.local_list.setMinimumWidth(0)
 
     def _refresh_local_item_size_hints(self) -> None:
         tile_w, tile_h, _ = self._compute_local_tile_metrics()
         size = QSize(tile_w, tile_h)
+        if self._last_local_tile_size == size:
+            return
+        self._last_local_tile_size = QSize(size)
         for idx in range(self.local_list.count()):
             item = self.local_list.item(idx)
             if item is not None:
                 item.setSizeHint(size)
+
+    def _apply_local_layout_refresh(self) -> None:
+        self._update_local_grid_size()
+        self._refresh_local_item_size_hints()
 
     def play_selected_imported(self) -> None:
         if self._delete_mode:
@@ -3392,11 +4524,34 @@ class SoundboardWindow(QMainWindow):
         sound_name = file_path.stem
         try:
             self.engine.soundboard.stop_all()
-            if sound_name not in self.engine.soundboard.sounds:
-                self.engine.soundboard.load_audio_file(sound_name, file_path)
-            self.engine.soundboard.trigger(sound_name)
-            self._play_sound_to_speaker_if_enabled(sound_name)
-            self.status_label.setText(f"Playing '{sound_name}' to virtual mic.")
+            if sound_name in self.engine.soundboard.sounds:
+                self.engine.soundboard.trigger(sound_name)
+                self._play_sound_to_speaker_if_enabled(sound_name)
+                self.status_label.setText(f"Playing '{sound_name}' to virtual mic.")
+                return
+
+            self.status_label.setText(f"Loading '{sound_name}'...")
+            worker = SoundLoadWorker(self.engine, [str(file_path)])
+
+            def done(result: dict) -> None:
+                loaded = int(result.get("loaded", 0) or 0)
+                if loaded <= 0:
+                    failed = result.get("failed", [])
+                    reason = failed[0] if isinstance(failed, list) and failed else "Unknown load error."
+                    QMessageBox.critical(self, "Play Imported", f"Failed to load '{file_name}': {reason}")
+                    return
+                try:
+                    self.engine.soundboard.stop_all()
+                    self.engine.soundboard.trigger(sound_name)
+                    self._play_sound_to_speaker_if_enabled(sound_name)
+                    self.status_label.setText(f"Playing '{sound_name}' to virtual mic.")
+                except Exception as exc:
+                    QMessageBox.critical(self, "Play Imported", f"Failed to play '{file_name}': {exc}")
+
+            def err(message: str) -> None:
+                QMessageBox.critical(self, "Play Imported", f"Failed to load '{file_name}': {message}")
+
+            self._run_worker(worker, done, err)
         except Exception as exc:
             QMessageBox.critical(self, "Play Imported", f"Failed to play '{file_name}': {exc}")
 
@@ -3477,32 +4632,20 @@ class SoundboardWindow(QMainWindow):
         self._exit_trim_mode()
         self.status_label.setText("Trim canceled.")
 
-    def _open_trim_editor_for_item(self, item: QListWidgetItem) -> None:
-        file_name = item.text().strip()
-        src = self.sounds_dir / file_name
-        if not src.exists():
-            self.status_label.setText("Selected file does not exist.")
-            self.refresh_local()
-            return
-        try:
-            audio, sr = _decode_audio_for_preview(src)
-        except Exception as exc:
-            self.status_label.setText(f"Failed to load trim audio: {exc}")
-            return
-
+    def _set_trim_editor_audio(self, src: Path, audio: np.ndarray, sr: int, status_text: str) -> None:
         self.stop_trim_preview(silent=True)
         self._trim_source_path = src
-        self._trim_audio = audio
-        self._trim_sr = sr
+        self._trim_audio = np.ascontiguousarray(audio, dtype=np.float32)
+        self._trim_sr = max(1, int(sr))
         self._trim_playhead = 0
-        total_frames = max(1, audio.shape[0])
-        max_ms = max(1, int((total_frames / sr) * 1000))
+        total_frames = max(1, int(self._trim_audio.shape[0]))
+        max_ms = max(1, int((total_frames / self._trim_sr) * 1000))
         self._trim_updating_slider = True
         self.trim_dialog.timeline.set_duration_ms(max_ms)
         self.trim_dialog.timeline.set_range_ms(0, max_ms, emit=False)
         self.trim_dialog.timeline.set_playhead_ms(0, emit=False)
         self._trim_updating_slider = False
-        self.trim_dialog.trim_target_label.setText(file_name)
+        self.trim_dialog.trim_target_label.setText(src.name)
         self.trim_dialog.trim_time_label.setText(f"00:00.00 / {self._format_ms(max_ms)}")
         self.trim_play_pause_btn.setText("Play")
         if not self.trim_dialog.isVisible():
@@ -3512,7 +4655,33 @@ class SoundboardWindow(QMainWindow):
             self.trim_dialog.show()
         self.trim_dialog.raise_()
         self.trim_dialog.activateWindow()
-        self.status_label.setText(f"Trim editor opened for '{file_name}'.")
+        self.status_label.setText(status_text)
+
+    def _open_trim_editor_for_item(self, item: QListWidgetItem) -> None:
+        file_name = item.text().strip()
+        src = self.sounds_dir / file_name
+        if not src.exists():
+            self.status_label.setText("Selected file does not exist.")
+            self.refresh_local()
+            return
+        self._trim_decode_request_id += 1
+        request_id = int(self._trim_decode_request_id)
+        self.status_label.setText(f"Loading trim audio for '{file_name}'...")
+        worker = AudioDecodeWorker(src)
+
+        def done(result: dict) -> None:
+            if request_id != self._trim_decode_request_id:
+                return
+            audio = np.asarray(result.get("audio"), dtype=np.float32)
+            sr = int(result.get("sr", 48000) or 48000)
+            self._set_trim_editor_audio(src, audio, sr, f"Trim editor opened for '{file_name}'.")
+
+        def err(message: str) -> None:
+            if request_id != self._trim_decode_request_id:
+                return
+            self.status_label.setText(f"Failed to load trim audio: {message}")
+
+        self._run_worker(worker, done, err)
 
     def _rename_imported_item(self, item: QListWidgetItem) -> None:
         old_name = item.text().strip()
@@ -3576,78 +4745,63 @@ class SoundboardWindow(QMainWindow):
             return
         start = start_ms / 1000.0
         length = (end_ms - start_ms) / 1000.0
-        with tempfile.NamedTemporaryFile(delete=False, suffix=src.suffix or ".wav") as tmp:
-            trimmed_tmp = Path(tmp.name)
-        cmd = [
-            ffmpeg_exe,
-            "-y",
-            "-v",
-            "error",
-            "-ss",
-            f"{start:.3f}",
-            "-t",
-            f"{length:.3f}",
-            "-i",
-            str(src),
-            "-vn",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            str(trimmed_tmp),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0 or not trimmed_tmp.exists():
-            trimmed_tmp.unlink(missing_ok=True)
-            self.status_label.setText("Failed to trim selected audio.")
-            self._notify_desktop(self.status_label.text(), title="Trim", error=True)
-            return
 
         self.stop_trim_preview(silent=True, reset_to_start=False)
-        try:
-            trimmed_tmp.replace(src)
-        except Exception as exc:
-            trimmed_tmp.unlink(missing_ok=True)
-            self.status_label.setText(f"Failed to overwrite '{src.name}': {exc}")
+        self.apply_trim_btn.setEnabled(False)
+        self.status_label.setText("Applying trim...")
+
+        trim_worker = TrimApplyWorker(
+            ffmpeg_exe=ffmpeg_exe,
+            src=src,
+            start=start,
+            length=length,
+            engine=self.engine,
+        )
+
+        self._trim_decode_request_id += 1
+        request_id = int(self._trim_decode_request_id)
+
+        def trim_done(result: dict) -> None:
+            self.apply_trim_btn.setEnabled(True)
+            reload_error = result.get("reload_error")
+            if reload_error:
+                self.status_label.setText(f"Trim saved, but failed to reload sound: {reload_error}")
+                self._notify_desktop(self.status_label.text(), title="Trim", error=True)
+                self.refresh_local()
+                return
+
+            self.refresh_local()
+            for i in range(self.local_list.count()):
+                item = self.local_list.item(i)
+                if item.text().strip().lower() == src.name.lower():
+                    self.local_list.setCurrentItem(item)
+                    break
+
+            self.status_label.setText("Trim saved. Reloading editor...")
+            decode_worker = AudioDecodeWorker(src)
+
+            def decode_done(decode_result: dict) -> None:
+                if request_id != self._trim_decode_request_id:
+                    return
+                audio = np.asarray(decode_result.get("audio"), dtype=np.float32)
+                sr = int(decode_result.get("sr", 48000) or 48000)
+                self._set_trim_editor_audio(src, audio, sr, f"Trim saved to '{src.name}'.")
+                self._notify_desktop(self.status_label.text(), title="Trim")
+
+            def decode_err(message: str) -> None:
+                if request_id != self._trim_decode_request_id:
+                    return
+                self.status_label.setText(f"Trim saved, but failed to reopen editor: {message}")
+                self._notify_desktop(self.status_label.text(), title="Trim", error=True)
+
+            self._run_worker(decode_worker, decode_done, decode_err)
+
+        def trim_err(message: str) -> None:
+            self.apply_trim_btn.setEnabled(True)
+            self.status_label.setText(f"Failed to trim: {message}")
             self._notify_desktop(self.status_label.text(), title="Trim", error=True)
-            return
 
-        try:
-            self.engine.soundboard.load_audio_file(src.stem, src)
-        except Exception as exc:
-            self.status_label.setText(f"Trim saved, but failed to reload sound: {exc}")
-            self._notify_desktop(self.status_label.text(), title="Trim", error=True)
-            return
-
-        try:
-            audio, sr = _decode_audio_for_preview(src)
-        except Exception as exc:
-            self.status_label.setText(f"Trim saved, but failed to reopen editor: {exc}")
-            self._notify_desktop(self.status_label.text(), title="Trim", error=True)
-            return
-
-        self._trim_source_path = src
-        self._trim_audio = audio
-        self._trim_sr = sr
-        self._trim_playhead = 0
-        max_ms = max(1, int((max(1, audio.shape[0]) / sr) * 1000))
-        self._trim_updating_slider = True
-        self.trim_dialog.timeline.set_duration_ms(max_ms)
-        self.trim_dialog.timeline.set_range_ms(0, max_ms, emit=False)
-        self.trim_dialog.timeline.set_playhead_ms(0, emit=False)
-        self._trim_updating_slider = False
-        self.trim_dialog.trim_target_label.setText(src.name)
-        self.trim_dialog.trim_time_label.setText(f"00:00.00 / {self._format_ms(max_ms)}")
-        self.trim_play_pause_btn.setText("Play")
-
-        self.refresh_local()
-        for i in range(self.local_list.count()):
-            item = self.local_list.item(i)
-            if item.text().strip().lower() == src.name.lower():
-                self.local_list.setCurrentItem(item)
-                break
-        self.status_label.setText(f"Trim saved to '{src.name}'.")
-        self._notify_desktop(self.status_label.text(), title="Trim")
+        self._run_worker(trim_worker, trim_done, trim_err)
 
     def delete_selected_imported(self) -> None:
         if not self._delete_mode:
@@ -3920,21 +5074,28 @@ class SoundboardWindow(QMainWindow):
         gain = float(self._volume_state.speaker_gain)
         if gain <= 0.0:
             return
-        try:
-            device = self._resolve_aux_output_device()
-            if device is None:
-                self.status_label.setText("Speaker monitor needs a non-virtual output device.")
-                return
+
+        # Resolve device + open stream off the UI thread.  sd.query_devices()
+        # and sd.OutputStream() can block for several seconds on Windows.
+        audio_copy = np.array(snd.audio, dtype=np.float32, copy=True, order="C")
+        sr = int(self.engine.samplerate)
+
+        def _speaker_task() -> None:
             try:
-                self._speaker_player.play(snd.audio, samplerate=self.engine.samplerate, device=device)
-            except Exception:
-                device = self._resolve_aux_output_device(force_refresh=True)
+                device = self._resolve_aux_output_device()
                 if device is None:
-                    self.status_label.setText("Speaker monitor needs a non-virtual output device.")
                     return
-                self._speaker_player.play(snd.audio, samplerate=self.engine.samplerate, device=device)
-        except Exception as exc:
-            self.status_label.setText(f"Speaker playback failed: {exc}")
+                try:
+                    self._speaker_player.play(audio_copy, samplerate=sr, device=device)
+                except Exception:
+                    device = self._resolve_aux_output_device(force_refresh=True)
+                    if device is None:
+                        return
+                    self._speaker_player.play(audio_copy, samplerate=sr, device=device)
+            except Exception as exc:
+                print(f"Speaker playback failed: {exc}")
+
+        threading.Thread(target=_speaker_task, daemon=True).start()
 
     def update_preview_volume_label(self, slider_value: int) -> None:
         gain = max(0.0, min(2.0, slider_value / 100.0))
@@ -3956,7 +5117,12 @@ class SoundboardWindow(QMainWindow):
             return
 
         self._persist_app_state()
+        self._end_import_progress()
         self._fetch_timeout.stop()
+        self._feed_scroll_debounce.stop()
+        self._feed_row_render_timer.stop()
+        self._import_search_timer.stop()
+        self._local_layout_timer.stop()
         self._preview_monitor.stop()
         self._trim_play_timer.stop()
         self.stop_remote_preview(silent=True)
@@ -3990,13 +5156,138 @@ class SoundboardWindow(QMainWindow):
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self._apply_window_mask()
-        self._update_local_grid_size()
-        self._refresh_local_item_size_hints()
+        self._local_layout_timer.start()
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _should_check_updates(state: AppState) -> bool:
+    return bool(state.autoUpdateEnabled)
+
+
+def _run_startup_auto_update(
+    app: QApplication,
+    state: AppState,
+    skip_update_once: bool,
+) -> bool:
+    if not getattr(sys, "frozen", False):
+        # Keep local source runs fast; updater is intended for installed builds.
+        return False
+
+    optional_updates_enabled = _should_check_updates(state)
+
+    update: UpdateInfo | None = None
+    check_ok = False
+    for attempt in range(1, 4):
+        state.lastUpdateAttemptUtc = _utc_now_iso()
+        try:
+            update = check_for_update(APP_VERSION)
+            check_ok = True
+            break
+        except Exception as exc:
+            print(f"Startup update check failed (attempt {attempt}/3): {exc}")
+
+    if check_ok:
+        state.lastUpdateCheckUtc = _utc_now_iso()
+        if update is not None:
+            state.lastUpdateVersionSeen = str(update.version)
+        save_app_state(state)
+    else:
+        save_app_state(state)
+        return False
+
+    if update is None:
+        return False
+
+    mandatory_update = bool(getattr(update, "mandatory", False))
+    if not mandatory_update:
+        if skip_update_once:
+            return False
+        if not optional_updates_enabled:
+            return False
+
+    update_info = update
+    update_dir = Path(tempfile.gettempdir())
+    update_dialog = UpdateDialog(APP_VERSION, update_info.version, mandatory=mandatory_update)
+    update_running = {"value": False}
+    worker_ref: dict[str, QObject | None] = {"worker": None}
+    thread_ref: dict[str, QThread | None] = {"thread": None}
+
+    def begin_update() -> None:
+        if update_running["value"]:
+            return
+        update_running["value"] = True
+        update_dialog.begin_update()
+
+        worker = StartupUpdateWorker(update_info, update_dir)
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.stage.connect(
+            lambda stage: update_dialog.set_extracting()
+            if str(stage).strip().lower() == "extract"
+            else None
+        )
+        worker.progress.connect(update_dialog.set_download_progress)
+
+        def done(payload: dict) -> None:
+            if not isinstance(payload, dict):
+                update_dialog.set_error("Update worker returned invalid payload.")
+                return
+
+            mode = str(payload.get("mode", "")).strip()
+            temp_dir = str(payload.get("temp_dir", "")).strip()
+            if not mode or not temp_dir:
+                update_dialog.set_error("Update payload missing mode or temp_dir.")
+                return
+
+            if not Path(temp_dir).exists():
+                update_dialog.set_error(f"Update temp directory missing: {temp_dir}")
+                return
+
+            update_dialog.set_installing()
+            try:
+                launch_apply_and_exit(mode, temp_dir, os.getpid())
+            except SystemExit:
+                update_dialog.finish_success()
+                update_dialog.accept()
+            except Exception as exc:
+                update_dialog.set_error(f"Update handoff failed: {exc}")
+
+        def err(message: str) -> None:
+            update_dialog.set_error(str(message))
+
+        worker.finished.connect(done)
+        worker.error.connect(err)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        def cleanup() -> None:
+            update_running["value"] = False
+            worker_ref["worker"] = None
+            thread_ref["thread"] = None
+
+        thread.finished.connect(cleanup)
+        worker_ref["worker"] = worker
+        thread_ref["thread"] = thread
+        thread.start()
+
+    update_dialog.updateRequested.connect(begin_update)
+    if mandatory_update:
+        QTimer.singleShot(0, begin_update)
+    dialog_code = update_dialog.exec()
+    return dialog_code == QDialog.DialogCode.Accepted
 
 
 def run_ui() -> int:
     launched_from_startup = STARTUP_ARG in sys.argv
-    argv = [arg for arg in sys.argv if arg != STARTUP_ARG]
+    skip_update_once = SKIP_UPDATE_ONCE_ARG in sys.argv
+    argv = [arg for arg in sys.argv if arg not in {STARTUP_ARG, SKIP_UPDATE_ONCE_ARG}]
     app = QApplication(argv)
     app.setQuitOnLastWindowClosed(False)
     app.setFont(QFont("Segoe UI", 11))
@@ -4007,6 +5298,14 @@ def run_ui() -> int:
     if not instance_lock.tryLock(100):
         if not launched_from_startup:
             QMessageBox.information(None, "SoundboardEZ", "SoundboardEZ is already running.")
+        return 0
+
+    app_state = load_app_state()
+    if _run_startup_auto_update(app, app_state, skip_update_once):
+        try:
+            instance_lock.unlock()
+        except Exception:
+            pass
         return 0
 
     app.setProperty("_single_instance_lock", instance_lock)

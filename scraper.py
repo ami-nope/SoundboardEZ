@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
-import time
+import subprocess
+import sys
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import requests
@@ -147,13 +149,99 @@ def _looks_blocked_html(html: str) -> bool:
     return any(marker in lowered for marker in _BLOCK_MARKERS)
 
 
+# Cache the resolved PowerShell path so we don't hit the PATH lookup on
+# every call.  Populated lazily by _powershell_exe().
+_POWERSHELL_EXE: str | None = None
+
+
+def _powershell_exe() -> str:
+    """Return the full path to powershell.exe (cached)."""
+    global _POWERSHELL_EXE
+    if _POWERSHELL_EXE is None:
+        import shutil
+        path = shutil.which("powershell")
+        _POWERSHELL_EXE = path or "powershell"
+    return _POWERSHELL_EXE
+
+
+def _fetch_via_dotnet(url: str, timeout: float) -> tuple[str, str]:
+    """Fetch a URL using PowerShell's Invoke-WebRequest (.NET HTTP stack).
+
+    The .NET TLS implementation is accepted by Cloudflare-protected sites
+    that reject Python's ssl module during the TLS handshake.
+    Returns (html_text, final_url).
+    """
+    timeout_sec = max(int(timeout), 8)
+    ps_script = (
+        f'$ProgressPreference = "SilentlyContinue"; '
+        f'$r = Invoke-WebRequest -Uri "{url}" -UseBasicParsing '
+        f'-TimeoutSec {timeout_sec} '
+        f'-UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        f'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"; '
+        f'@{{ status = $r.StatusCode; url = $r.BaseResponse.ResponseUri.AbsoluteUri; '
+        f'content = $r.Content }} | ConvertTo-Json -Compress'
+    )
+    result = subprocess.run(
+        [_powershell_exe(), "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec + 10,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"PowerShell fetch failed (rc={result.returncode}): {result.stderr[:300]}")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError("PowerShell returned non-JSON output")
+    status = int(data.get("status", 0))
+    if status < 200 or status >= 400:
+        raise RuntimeError(f"HTTP {status}")
+    content = str(data.get("content", ""))
+    resolved_url = str(data.get("url", "") or url)
+    return content, resolved_url
+
+
+def download_via_dotnet(url: str, dst_path: str, timeout: float = 30.0) -> None:
+    """Download a binary file using .NET WebClient (avoids TLS rejection)."""
+    timeout_ms = int(max(timeout, 10) * 1000)
+    # Use [System.Net.WebClient] for efficient binary downloads.
+    ps_script = (
+        f'$ProgressPreference = "SilentlyContinue"; '
+        f'$wc = New-Object System.Net.WebClient; '
+        f'$wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        f'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"); '
+        f'$wc.DownloadFile("{url}", "{dst_path}")'
+    )
+    result = subprocess.run(
+        [_powershell_exe(), "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        timeout=int(timeout) + 15,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Download failed: {result.stderr[:300]}")
+
+
 def _fetch_page_html(url: str, timeout: float) -> tuple[str, str]:
+    # Try .NET HTTP stack first (Windows) – its TLS implementation is accepted
+    # by Cloudflare whereas Python's ssl/urllib3 gets connection-reset.
+    # Only try the primary URL to avoid spawning many PowerShell processes.
+    if sys.platform == "win32":
+        try:
+            text, resolved = _fetch_via_dotnet(url, timeout)
+            if text and not (_looks_blocked_html(text) and 'class="instant"' not in text):
+                return text, resolved
+        except Exception:
+            pass  # fall through to requests-based attempts
+
     errors: list[str] = []
     timeout_pair: tuple[float, float] = (8.0, max(float(timeout), 8.0))
     attempt = 0
 
     max_rounds = 3
-    for round_idx in range(max_rounds):
+    for _round_idx in range(max_rounds):
         for candidate_url in _candidate_feed_urls(url):
             for profile in _HEADER_PROFILES:
                 attempt += 1
@@ -168,8 +256,6 @@ def _fetch_page_html(url: str, timeout: float) -> tuple[str, str]:
                     return text, response.url
                 except requests.RequestException as exc:
                     errors.append(f"attempt {attempt}: {exc}")
-                    wait = min(2.5, (0.2 * attempt) + (0.35 * round_idx))
-                    time.sleep(wait)
                 finally:
                     session.close()
 

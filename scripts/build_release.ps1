@@ -1,6 +1,6 @@
 param(
-  [string]$PythonExe = "python",
-  [string]$NSISExe = "makensis"
+  [string]$PythonExe = "venv\\Scripts\\python.exe",
+  [string]$NSISExe = "C:\\Program Files (x86)\\NSIS\\makensis.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,13 +33,18 @@ if ($LASTEXITCODE -ne 0) {
   throw "NSIS build failed."
 }
 
-$installerPath = Join-Path $repoRoot "SoundboardEZ-Setup.exe"
+$installerDir = Join-Path $repoRoot "installers"
+if (-not (Test-Path -LiteralPath $installerDir)) {
+  New-Item -ItemType Directory -Path $installerDir | Out-Null
+}
+
+$installerPath = Join-Path $installerDir "SoundboardEZ-Setup.exe"
 if (-not (Test-Path -LiteralPath $installerPath)) {
   throw "Installer output was not found at $installerPath"
 }
 
 $hash = Get-FileHash -Path $installerPath -Algorithm SHA256
-$checksumPath = Join-Path $repoRoot "SoundboardEZ-Setup.exe.sha256"
+$checksumPath = Join-Path $installerDir "SoundboardEZ-Setup.exe.sha256"
 "$($hash.Hash.ToLowerInvariant())  SoundboardEZ-Setup.exe" | Set-Content -Path $checksumPath -Encoding ascii
 
 Write-Host "Build complete."

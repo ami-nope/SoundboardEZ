@@ -11,13 +11,14 @@
 !define /ifndef APPVERSION "1.0.0"
 !define EXE_NAME "SoundboardEZ.exe"
 !define INSTALLER_NAME "SoundboardEZ-Setup.exe"
+!define INSTALLER_DIR "installers"
 !define APPDIR "$PROGRAMFILES64\\${APPNAME}"
 !define STARTMENU_FOLDER "${APPNAME}"
 !define APPREG_KEY "Software\\${COMPANY}\\${APPNAME}"
 !define UNINSTALL_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${APPNAME}"
 
 Name "${APPNAME}"
-OutFile "${INSTALLER_NAME}"
+OutFile "${INSTALLER_DIR}\\${INSTALLER_NAME}"
 RequestExecutionLevel admin
 InstallDir "${APPDIR}"
 InstallDirRegKey HKLM "${APPREG_KEY}" "InstallDir"
@@ -36,6 +37,9 @@ BrandingText "${APPNAME} Installer"
 
 Var StartMenuFolder
 Var VBCableSetupExitCode
+Var UpdateMode
+Var SkipVBCable
+Var AutoLaunch
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
@@ -51,9 +55,34 @@ Function .onInit
   ${EndIf}
   SetShellVarContext all
 
+  StrCpy $UpdateMode 0
+  StrCpy $SkipVBCable 0
+  StrCpy $AutoLaunch 0
+
+  ${GetParameters} $R0
+  ${GetOptions} "$R0" "/UPDATE=" $R1
+  ${If} $R1 == "1"
+    StrCpy $UpdateMode 1
+    StrCpy $SkipVBCable 1
+  ${EndIf}
+
+  ${GetOptions} "$R0" "/SKIPVBCABLE=" $R1
+  ${If} $R1 == "1"
+    StrCpy $SkipVBCable 1
+  ${EndIf}
+
+  ${GetOptions} "$R0" "/AUTOLAUNCH=" $R1
+  ${If} $R1 == "1"
+    StrCpy $AutoLaunch 1
+  ${EndIf}
+
   ReadRegStr $0 HKLM "${APPREG_KEY}" "InstallDir"
   ${If} $0 != ""
     StrCpy $INSTDIR $0
+  ${EndIf}
+
+  ${If} $UpdateMode == 1
+    Return
   ${EndIf}
 
   IfFileExists "$INSTDIR\\Uninstall.exe" 0 done
@@ -70,63 +99,79 @@ done:
 FunctionEnd
 
 Function RunVBCableInstaller
-  StrCpy $VBCableSetupExitCode 0
-  IfFileExists "$INSTDIR\\VBCABLE_Driver_Pack43.zip" 0 done
-
-  CreateDirectory "$INSTDIR\\vb-cable"
-  StrCpy $0 "$\"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe$\" -NoProfile -ExecutionPolicy Bypass -Command $\"Expand-Archive -LiteralPath '$INSTDIR\\VBCABLE_Driver_Pack43.zip' -DestinationPath '$INSTDIR\\vb-cable' -Force$\""
-  ExecWait $0 $1
-  ${If} $1 != 0
-    MessageBox MB_ICONEXCLAMATION "VB-Cable extraction failed (code $1). Run setup manually from $INSTDIR\\vb-cable."
-    Goto done
+  ${If} $SkipVBCable == 1
+    Return
   ${EndIf}
 
-  IfFileExists "$INSTDIR\\vb-cable\\VBCABLE_Setup_x64.exe" 0 +6
-    ExecWait '"$INSTDIR\\vb-cable\\VBCABLE_Setup_x64.exe"' $VBCableSetupExitCode
-    ${If} $VBCableSetupExitCode != 0
-      MessageBox MB_ICONEXCLAMATION "VB-Cable x64 setup returned code $VBCableSetupExitCode. Approve driver prompts and reboot if requested."
-    ${EndIf}
-    Goto done
+  StrCpy $VBCableSetupExitCode 0
+  IfFileExists "$INSTDIR\\VBCABLE_Driver_Pack43.zip" has_zip missing_zip
 
-  IfFileExists "$INSTDIR\\vb-cable\\VBCABLE_Setup.exe" 0 missing
-    ExecWait '"$INSTDIR\\vb-cable\\VBCABLE_Setup.exe"' $VBCableSetupExitCode
-    ${If} $VBCableSetupExitCode != 0
-      MessageBox MB_ICONEXCLAMATION "VB-Cable setup returned code $VBCableSetupExitCode. Approve driver prompts and reboot if requested."
-    ${EndIf}
-    Goto done
+missing_zip:
+  MessageBox MB_ICONEXCLAMATION "Bundled VB-Cable package not found at:$\r$\n$INSTDIR\VBCABLE_Driver_Pack43.zip$\r$\n$\r$\nRe-run setup with a complete installer."
+  Return
 
-missing:
+has_zip:
+  CreateDirectory "$INSTDIR\\vb-cable"
+  StrCpy $0 '"$SYSDIR\\cmd.exe" /c tar -xf "$INSTDIR\\VBCABLE_Driver_Pack43.zip" -C "$INSTDIR\\vb-cable"'
+  ExecWait $0 $1
+  ${If} $1 != 0
+    DetailPrint "tar extraction failed (code $1). Trying PowerShell fallback..."
+    StrCpy $0 "$\"$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe$\" -NoProfile -ExecutionPolicy Bypass -Command $\"Expand-Archive -LiteralPath '$INSTDIR\\VBCABLE_Driver_Pack43.zip' -DestinationPath '$INSTDIR\\vb-cable' -Force$\""
+    ExecWait $0 $2
+    ${If} $2 != 0
+      MessageBox MB_ICONEXCLAMATION "VB-Cable extraction failed. Run setup manually from:$\r$\n$INSTDIR\\vb-cable"
+      Return
+    ${EndIf}
+  ${EndIf}
+
+  IfFileExists "$INSTDIR\\vb-cable\\VBCABLE_Setup_x64.exe" run_x64 check_x86
+
+run_x64:
+  ExecWait '"$INSTDIR\\vb-cable\\VBCABLE_Setup_x64.exe"' $VBCableSetupExitCode
+  ${If} $VBCableSetupExitCode != 0
+    MessageBox MB_ICONEXCLAMATION "VB-Cable x64 setup returned code $VBCableSetupExitCode. Approve driver prompts and reboot if requested."
+  ${EndIf}
+  Goto verify
+
+check_x86:
+  IfFileExists "$INSTDIR\\vb-cable\\VBCABLE_Setup.exe" 0 missing_setup
+  ExecWait '"$INSTDIR\\vb-cable\\VBCABLE_Setup.exe"' $VBCableSetupExitCode
+  ${If} $VBCableSetupExitCode != 0
+    MessageBox MB_ICONEXCLAMATION "VB-Cable setup returned code $VBCableSetupExitCode. Approve driver prompts and reboot if requested."
+  ${EndIf}
+  Goto verify
+
+missing_setup:
   MessageBox MB_ICONEXCLAMATION "VB-Cable setup executable was not found in $INSTDIR\\vb-cable."
+  Return
 
-done:
+verify:
+  ExecWait '"$SYSDIR\\pnputil.exe" /scan-devices' $2
+  Return
 FunctionEnd
 
-Section "Install"
+Section "!SoundboardEZ (Required)" SEC_APP
+  SectionIn RO
   SetOutPath "$INSTDIR"
 
   ; Main app
   File "dist\\SoundboardEZ.exe"
 
-  ; Optional sounds (if present)
-  IfFileExists "sounds\\*.*" 0 +3
+  ; Optional sounds (compile-time include only when present)
+  !if /FileExists "sounds\\*.*"
     CreateDirectory "$INSTDIR\\sounds"
     File /r "sounds\\*.*"
+  !endif
 
-  ; Assets
-  IfFileExists "assets\\app.ico" 0 +2
-    File "/oname=$INSTDIR\\app.ico" "assets\\app.ico"
-
-  IfFileExists "assets\\VBCABLE_Driver_Pack43.zip" 0 +2
-    File "/oname=$INSTDIR\\VBCABLE_Driver_Pack43.zip" "assets\\VBCABLE_Driver_Pack43.zip"
-
-  ; README
-  IfFileExists "README_INSTALL.txt" 0 +2
-    File "/oname=$INSTDIR\\README_INSTALL.txt" "README_INSTALL.txt"
+  ; Assets and README
+  File "/oname=$INSTDIR\\app.ico" "assets\\app.ico"
+  File "/oname=$INSTDIR\\VBCABLE_Driver_Pack43.zip" "assets\\VBCABLE_Driver_Pack43.zip"
+  File "/oname=$INSTDIR\\README_INSTALL.txt" "README_INSTALL.txt"
 
   ; Uninstaller
   WriteUninstaller "$INSTDIR\\Uninstall.exe"
 
-  ; VB-Cable install in same execution
+  ; VB-Cable install in same execution unless explicitly skipped.
   Call RunVBCableInstaller
 
   ; Shortcuts
@@ -146,6 +191,11 @@ Section "Install"
   WriteRegStr HKLM "${UNINSTALL_KEY}" "QuietUninstallString" '"$INSTDIR\\Uninstall.exe" /S'
   WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoModify" 1
   WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoRepair" 1
+
+  ; Silent update mode relaunch.
+  ${If} $AutoLaunch == 1
+    Exec '"$INSTDIR\\${EXE_NAME}" --skip-update-once'
+  ${EndIf}
 SectionEnd
 
 Function un.onInit

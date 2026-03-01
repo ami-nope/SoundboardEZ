@@ -16,6 +16,10 @@ class AppState:
     startSoundboardOnLaunch: bool = True
     soundboardEnabled: bool = True
     allowNotifications: bool = False
+    autoUpdateEnabled: bool = True
+    lastUpdateCheckUtc: str = ""
+    lastUpdateAttemptUtc: str = ""
+    lastUpdateVersionSeen: str = ""
 
 
 def _state_file_path() -> Path:
@@ -47,6 +51,10 @@ def load_app_state() -> AppState:
     )
     state.soundboardEnabled = bool(data.get("soundboardEnabled", state.soundboardEnabled))
     state.allowNotifications = bool(data.get("allowNotifications", state.allowNotifications))
+    state.autoUpdateEnabled = bool(data.get("autoUpdateEnabled", state.autoUpdateEnabled))
+    state.lastUpdateCheckUtc = str(data.get("lastUpdateCheckUtc", state.lastUpdateCheckUtc) or "")
+    state.lastUpdateAttemptUtc = str(data.get("lastUpdateAttemptUtc", state.lastUpdateAttemptUtc) or "")
+    state.lastUpdateVersionSeen = str(data.get("lastUpdateVersionSeen", state.lastUpdateVersionSeen) or "")
     return state
 
 

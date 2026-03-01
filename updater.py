@@ -1,264 +1,455 @@
+"""SoundboardEZ updater — delta patches, full replacement, rollback & crash recovery.
+
+This module is imported by both the main UI process (to kick off downloads) and
+the ``--apply-update`` child process (to perform the actual file replacement
+while the original exe is not running).
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
-import hashlib
+import json
 import os
 from pathlib import Path
-import re
+import shutil
 import subprocess
-import tempfile
-import textwrap
-import uuid
+import sys
+import time
+import zipfile
 
 import requests
 
 
-GITHUB_OWNER = "ami-nope"
-GITHUB_REPO = "SoundboardEZ"
-LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-INSTALLER_ASSET_NAME = "SoundboardEZ-Setup.exe"
-CHECKSUM_ASSET_NAME = "SoundboardEZ-Setup.exe.sha256"
-HTTP_TIMEOUT = (8.0, 30.0)
+HTTP_TIMEOUT = (8.0, 120.0)
+DEFAULT_EXE_NAME = "SoundboardEZ.exe"
+BACKUP_DIR_NAME = "_backup"
+FLAG_FILE_NAME = "update_in_progress.flag"
 
 
-@dataclass(frozen=True)
-class UpdateInfo:
-    version: str
-    tag: str
-    installer_url: str
-    checksum_url: str
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _install_dir() -> Path:
+    """Resolve the application install directory (the folder containing the exe)."""
+    return Path(sys.executable).resolve().parent
 
 
-def _normalize_version(value: str) -> str:
-    text = str(value or "").strip()
-    if text.lower().startswith("v"):
-        text = text[1:]
-    return text
+def _flag_path(install_dir: Path | None = None) -> Path:
+    return (install_dir or _install_dir()) / FLAG_FILE_NAME
 
 
-def _version_tuple(value: str) -> tuple[int, ...]:
-    normalized = _normalize_version(value)
-    parts = re.findall(r"\d+", normalized)
-    if not parts:
-        return (0,)
-    return tuple(int(part) for part in parts)
+def _backup_dir(install_dir: Path | None = None) -> Path:
+    return (install_dir or _install_dir()) / BACKUP_DIR_NAME
 
 
-def compare_versions(left: str, right: str) -> int:
-    a = _version_tuple(left)
-    b = _version_tuple(right)
-    width = max(len(a), len(b))
-    a = a + (0,) * (width - len(a))
-    b = b + (0,) * (width - len(b))
-    if a < b:
-        return -1
-    if a > b:
-        return 1
-    return 0
+# ── download ───────────────────────────────────────────────────────────────
 
+def download_file(url: str, dest: Path, progress_cb=None) -> Path:
+    """Stream-download *url* → *.part*, then atomically rename to *dest*."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.parent / (dest.name + ".part")
 
-def _asset_download_url(release_data: dict, asset_name: str) -> str:
-    assets = release_data.get("assets")
-    if not isinstance(assets, list):
-        return ""
-    for asset in assets:
-        if not isinstance(asset, dict):
-            continue
-        if str(asset.get("name", "")).strip() != asset_name:
-            continue
-        return str(asset.get("browser_download_url", "")).strip()
-    return ""
-
-
-def check_for_update(current_version: str) -> UpdateInfo | None:
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "SoundboardEZ-Updater",
-    }
-    response = requests.get(LATEST_RELEASE_API, headers=headers, timeout=HTTP_TIMEOUT)
-    response.raise_for_status()
-
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError("Invalid release payload from update server.")
-
-    tag = str(payload.get("tag_name", "")).strip()
-    if not tag:
-        raise RuntimeError("Release payload missing tag_name.")
-
-    release_version = _normalize_version(tag)
-    if compare_versions(release_version, current_version) <= 0:
-        return None
-
-    installer_url = _asset_download_url(payload, INSTALLER_ASSET_NAME)
-    checksum_url = _asset_download_url(payload, CHECKSUM_ASSET_NAME)
-    if not installer_url or not checksum_url:
-        raise RuntimeError("Latest release is missing required installer/checksum assets.")
-
-    return UpdateInfo(
-        version=release_version,
-        tag=tag,
-        installer_url=installer_url,
-        checksum_url=checksum_url,
-    )
-
-
-def _parse_checksum(checksum_text: str) -> str:
-    match = re.search(r"\b([0-9a-fA-F]{64})\b", str(checksum_text))
-    if match is None:
-        raise ValueError("Checksum file does not contain a SHA256 hash.")
-    return match.group(1).lower()
-
-
-def verify_sha256(file_path: Path, checksum_text: str) -> bool:
-    expected = _parse_checksum(checksum_text)
-    digest = hashlib.sha256()
-    with Path(file_path).open("rb") as fh:
-        while True:
-            block = fh.read(1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-    actual = digest.hexdigest().lower()
-    return actual == expected
-
-
-def download_update(
-    update: UpdateInfo,
-    dest_dir: Path,
-    progress_cb=None,
-) -> Path:
-    target_dir = Path(dest_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    installer_path = target_dir / f"SoundboardEZ-Setup-{update.version}.exe"
-    partial_path = installer_path.with_suffix(".exe.part")
-
-    for path in (installer_path, partial_path):
+    for p in (dest, partial):
         try:
-            if path.exists():
-                path.unlink()
+            if p.exists():
+                p.unlink()
         except Exception:
             pass
-
-    checksum_response = requests.get(update.checksum_url, timeout=HTTP_TIMEOUT)
-    checksum_response.raise_for_status()
-    checksum_text = checksum_response.text
-    _parse_checksum(checksum_text)
 
     downloaded = 0
-    total_size: int | None = None
-    try:
-        with requests.get(update.installer_url, stream=True, timeout=HTTP_TIMEOUT) as response:
-            response.raise_for_status()
-            content_length = response.headers.get("content-length", "").strip()
-            if content_length.isdigit():
-                total_size = int(content_length)
-            if callable(progress_cb):
-                progress_cb(downloaded, total_size)
+    total: int | None = None
 
-            with partial_path.open("wb") as fh:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    fh.write(chunk)
-                    downloaded += len(chunk)
-                    if callable(progress_cb):
-                        progress_cb(downloaded, total_size)
-        partial_path.replace(installer_path)
-    except Exception:
-        try:
-            partial_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
+    with requests.get(str(url), stream=True, timeout=HTTP_TIMEOUT) as resp:
+        resp.raise_for_status()
+        cl = str(resp.headers.get("content-length", "")).strip()
+        if cl.isdigit():
+            total = int(cl)
+        if callable(progress_cb):
+            progress_cb(0, total)
 
-    if not verify_sha256(installer_path, checksum_text):
-        try:
-            installer_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise RuntimeError("Downloaded installer failed checksum verification.")
+        with partial.open("wb") as fh:
+            for chunk in resp.iter_content(chunk_size=512 * 1024):
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                downloaded += len(chunk)
+                if callable(progress_cb):
+                    progress_cb(downloaded, total)
 
+    partial.replace(dest)
     if callable(progress_cb):
-        progress_cb(total_size or downloaded, total_size or downloaded)
-    return installer_path
+        progress_cb(total or downloaded, total or downloaded)
+    return dest
 
 
-def _ps_quote(value: str) -> str:
-    return str(value).replace("'", "''")
+# ── delta download (multiple files) ───────────────────────────────────────
+
+def download_delta_files(
+    delta_files: list[tuple[str, str]],
+    temp_dir: Path,
+    progress_cb=None,
+) -> list[tuple[str, Path]]:
+    """Download every delta file into *temp_dir*, preserving relative paths.
+
+    *delta_files* is a list of ``(relative_path, url)`` pairs.
+    Returns ``[(relative_path, local_path), ...]``.
+    """
+    temp_dir = Path(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    total_files = len(delta_files)
+    results: list[tuple[str, Path]] = []
+
+    for idx, (rel_path, url) in enumerate(delta_files):
+        local = temp_dir / rel_path
+        local.parent.mkdir(parents=True, exist_ok=True)
+
+        def _file_progress(downloaded: int, total: int | None) -> None:
+            if callable(progress_cb):
+                # Emit an aggregate fraction: file-index / total-files is a rough %
+                file_frac = (idx + (downloaded / max(total or 1, 1))) / total_files
+                progress_cb(int(file_frac * 100), 100)
+
+        download_file(url, local, progress_cb=_file_progress)
+        results.append((rel_path, local))
+
+    return results
 
 
-def schedule_installer_handoff(installer_path: Path, install_dir: Path, old_pid: int) -> bool:
-    installer = Path(installer_path).resolve()
-    install_root = Path(install_dir).resolve()
-    if not installer.exists():
-        return False
+# ── full-update extraction ─────────────────────────────────────────────────
 
-    script_path = Path(tempfile.gettempdir()) / f"SoundboardEZ_update_{uuid.uuid4().hex}.ps1"
-    script_body = textwrap.dedent(
-        f"""
-        $ErrorActionPreference = 'SilentlyContinue'
-        $pidToWait = {int(old_pid)}
-        $installer = '{_ps_quote(str(installer))}'
-        $installDir = '{_ps_quote(str(install_root))}'
+def extract_full_package(pkg_path: Path, extract_dir: Path) -> Path:
+    """Extract a full ZIP into *extract_dir*.  Returns root of extracted tree."""
+    pkg = Path(pkg_path)
+    target = Path(extract_dir)
 
-        for ($i = 0; $i -lt 120; $i++) {{
-            $proc = Get-Process -Id $pidToWait -ErrorAction SilentlyContinue
-            if ($null -eq $proc) {{
-                break
-            }}
-            Start-Sleep -Milliseconds 500
-        }}
-
-        if (-not (Test-Path -LiteralPath $installer)) {{
-            exit 2
-        }}
-
-        $args = @('/S', '/UPDATE=1', '/SKIPVBCABLE=1', '/AUTOLAUNCH=1', ('/D=' + $installDir))
-        $proc = Start-Process -FilePath $installer -ArgumentList $args -Wait -PassThru
-        $exitCode = 0
-        if ($null -ne $proc) {{
-            $exitCode = [int]$proc.ExitCode
-        }}
-
-        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 500
-        Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
-        exit $exitCode
-        """
-    ).strip() + "\n"
-
-    try:
-        script_path.write_text(script_body, encoding="utf-8")
-    except Exception:
-        return False
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(parents=True, exist_ok=True)
 
     try:
-        creationflags = 0
-        if os.name == "nt":
-            creationflags = (
-                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                | getattr(subprocess, "DETACHED_PROCESS", 0)
+        with zipfile.ZipFile(pkg, "r") as zf:
+            zf.extractall(target)
+    except zipfile.BadZipFile:
+        sig = b""
+        try:
+            with pkg.open("rb") as fh:
+                sig = fh.read(2)
+        except Exception:
+            pass
+        if sig == b"MZ":
+            exe_name = (
+                Path(sys.executable).name
+                if getattr(sys, "frozen", False)
+                else DEFAULT_EXE_NAME
             )
+            shutil.copy2(pkg, target / exe_name)
+            return target
+        raise RuntimeError("Downloaded file is not a valid ZIP or EXE.")
+
+    entries = [p for p in target.iterdir() if p.exists()]
+    if not entries:
+        raise RuntimeError("Extracted package is empty.")
+
+    top_files = [p for p in entries if p.is_file()]
+    top_dirs = [p for p in entries if p.is_dir()]
+    if not top_files and len(top_dirs) == 1:
+        return top_dirs[0]
+    return target
+
+
+# ── backup & rollback ─────────────────────────────────────────────────────
+
+def _create_backup(install_dir: Path, relative_paths: list[str]) -> None:
+    """Copy originals into ``_backup/`` before overwriting."""
+    backup = _backup_dir(install_dir)
+    backup.mkdir(parents=True, exist_ok=True)
+    for rel in relative_paths:
+        src = install_dir / rel
+        if not src.exists():
+            continue
+        dst = backup / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(src, dst)
+        except Exception:
+            pass
+
+
+def rollback_from_backup(install_dir: Path | None = None) -> bool:
+    """Restore files from ``_backup/`` and remove the flag.  Returns True on success."""
+    root = install_dir or _install_dir()
+    backup = _backup_dir(root)
+    if not backup.exists():
+        return False
+
+    for item in backup.rglob("*"):
+        if not item.is_file():
+            continue
+        rel = item.relative_to(backup)
+        dest = root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(item, dest)
+        except Exception:
+            pass
+
+    # Clean up
+    shutil.rmtree(backup, ignore_errors=True)
+    try:
+        _flag_path(root).unlink(missing_ok=True)
+    except Exception:
+        pass
+    return True
+
+
+def check_and_rollback_on_startup() -> bool:
+    """If an interrupted update is detected, roll back and return True."""
+    root = _install_dir()
+    flag = _flag_path(root)
+    if not flag.exists():
+        return False
+    print("[updater] Interrupted update detected – rolling back from _backup")
+    return rollback_from_backup(root)
+
+
+def clear_update_flag() -> None:
+    """Called after a successful launch to remove the in-progress flag."""
+    try:
+        flag = _flag_path()
+        flag.unlink(missing_ok=True)
+    except Exception:
+        pass
+    # Also clean up the backup directory on successful launch
+    try:
+        backup = _backup_dir()
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+    except Exception:
+        pass
+
+
+# ── write flag ─────────────────────────────────────────────────────────────
+
+def _write_flag(install_dir: Path, update_info_json: str) -> None:
+    """Drop the ``update_in_progress.flag`` containing metadata."""
+    flag = _flag_path(install_dir)
+    flag.write_text(update_info_json, encoding="utf-8")
+
+
+# ── delta apply ────────────────────────────────────────────────────────────
+
+def _apply_delta(
+    downloaded: list[tuple[str, Path]],
+    install_dir: Path,
+    exe_name: str,
+) -> None:
+    """Replace individual files in *install_dir* from downloaded delta files."""
+    rel_paths = [r for r, _ in downloaded]
+    _create_backup(install_dir, rel_paths)
+
+    _write_flag(install_dir, json.dumps({"mode": "delta", "files": rel_paths}))
+
+    for rel_path, local_file in downloaded:
+        dest = install_dir / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        # If the target is the running exe, rename it first
+        if dest.name.lower() == exe_name.lower() and dest.exists():
+            old = dest.parent / (dest.name + ".old")
+            try:
+                if old.exists():
+                    old.unlink()
+            except Exception:
+                pass
+            try:
+                dest.rename(old)
+            except Exception:
+                pass
+
+        try:
+            shutil.copy2(local_file, dest)
+        except PermissionError:
+            # On Windows the exe might still be locked briefly; retry once
+            time.sleep(1.0)
+            shutil.copy2(local_file, dest)
+
+
+# ── full apply ─────────────────────────────────────────────────────────────
+
+def _apply_full(
+    source_dir: Path,
+    install_dir: Path,
+    exe_name: str,
+) -> None:
+    """Replace the entire install directory from the extracted full package.
+
+    User config (``app_state.json`` in ``%APPDATA%``) is NOT in install_dir
+    so it survives automatically.
+    """
+    # Back up all existing files
+    existing_files = []
+    for item in install_dir.rglob("*"):
+        if not item.is_file():
+            continue
+        rel = str(item.relative_to(install_dir))
+        if rel.startswith(BACKUP_DIR_NAME):
+            continue
+        existing_files.append(rel)
+    _create_backup(install_dir, existing_files)
+
+    _write_flag(install_dir, json.dumps({"mode": "full"}))
+
+    current_exe = install_dir / exe_name
+    backup_exe = install_dir / (exe_name + ".old")
+
+    if current_exe.exists():
+        try:
+            if backup_exe.exists():
+                backup_exe.unlink()
+        except Exception:
+            pass
+        try:
+            current_exe.rename(backup_exe)
+        except Exception:
+            pass
+
+    for item in Path(source_dir).rglob("*"):
+        if item.is_file():
+            rel = item.relative_to(source_dir)
+            dest = install_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(item, dest)
+            except Exception:
+                pass
+
+
+# ── process handoff ────────────────────────────────────────────────────────
+
+def launch_apply_and_exit(
+    update_mode: str,
+    temp_dir: str,
+    pid: int,
+) -> None:
+    """Spawn the current exe in ``--apply-update`` mode and exit this process.
+
+    *update_mode* is ``"delta"`` or ``"full"``.
+    *temp_dir* is the directory holding either the delta files or the full zip.
+    """
+    exe = sys.executable
+    args = [
+        exe,
+        "--apply-update",
+        "--update-mode", update_mode,
+        "--update-temp", str(Path(temp_dir).resolve()),
+        "--old-pid", str(int(pid)),
+    ]
+    flags = 0
+    if os.name == "nt":
+        flags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        )
+    subprocess.Popen(args, creationflags=flags, close_fds=True)
+    sys.exit(0)
+
+
+# ── --apply-update entry point ─────────────────────────────────────────────
+
+def _wait_for_pid(pid: int, timeout: float = 60.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.5)
+
+
+def _parse_apply_args() -> dict:
+    """Extract ``--apply-update`` flags from sys.argv."""
+    result: dict = {}
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--update-mode" and i + 1 < len(args):
+            result["mode"] = args[i + 1]
+            i += 2
+        elif args[i] == "--update-temp" and i + 1 < len(args):
+            result["temp"] = args[i + 1]
+            i += 2
+        elif args[i] == "--old-pid" and i + 1 < len(args):
+            try:
+                result["pid"] = int(args[i + 1])
+            except ValueError:
+                pass
+            i += 2
+        else:
+            i += 1
+    return result
+
+
+def apply_update_from_args() -> None:
+    """Full ``--apply-update`` handler.
+
+    1. Wait for original PID to exit.
+    2. Apply delta or full update.
+    3. Remove flag on success.
+    4. Relaunch with ``--skip-update-once``.
+    """
+    parsed = _parse_apply_args()
+    mode = parsed.get("mode", "")
+    temp_dir = parsed.get("temp", "")
+    old_pid = parsed.get("pid")
+
+    if not mode or not temp_dir or old_pid is None:
+        sys.exit(1)
+
+    _wait_for_pid(old_pid)
+
+    install_dir = _install_dir()
+    exe_name = Path(sys.executable).name
+    temp_path = Path(temp_dir)
+
+    try:
+        if mode == "delta":
+            # temp_dir holds individual files mirroring install structure
+            downloaded: list[tuple[str, Path]] = []
+            for item in temp_path.rglob("*"):
+                if item.is_file():
+                    rel = str(item.relative_to(temp_path))
+                    downloaded.append((rel, item))
+            _apply_delta(downloaded, install_dir, exe_name)
+        elif mode == "full":
+            # temp_dir should contain a .pkg zip (or already-extracted folder)
+            pkg_candidates = list(temp_path.glob("*.pkg"))
+            if pkg_candidates:
+                extract_dir = temp_path / "extracted"
+                source_dir = extract_full_package(pkg_candidates[0], extract_dir)
+            else:
+                # Assume temp_dir IS the extracted content
+                source_dir = temp_path
+            _apply_full(source_dir, install_dir, exe_name)
+        else:
+            sys.exit(2)
+
+        # Success – remove flag
+        try:
+            _flag_path(install_dir).unlink(missing_ok=True)
+        except Exception:
+            pass
+    finally:
+        # Clean up temp files
+        try:
+            if temp_path.exists():
+                shutil.rmtree(temp_path, ignore_errors=True)
+        except Exception:
+            pass
+
+    # Relaunch
+    new_exe = install_dir / exe_name
+    if new_exe.exists():
         subprocess.Popen(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-File",
-                str(script_path),
-            ],
-            creationflags=creationflags,
+            [str(new_exe), "--skip-update-once"],
             close_fds=True,
         )
-        return True
-    except Exception:
-        try:
-            script_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return False
+    sys.exit(0)
