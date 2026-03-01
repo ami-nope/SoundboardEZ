@@ -346,7 +346,8 @@ def launch_apply_and_exit(
     flags = 0
     if os.name == "nt":
         flags = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            0x08000000  # CREATE_NO_WINDOW
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
         )
     subprocess.Popen(args, creationflags=flags, close_fds=True)
@@ -448,8 +449,12 @@ def apply_update_from_args() -> None:
     # Relaunch
     new_exe = install_dir / exe_name
     if new_exe.exists():
+        relaunch_flags = 0
+        if os.name == "nt":
+            relaunch_flags = 0x08000000  # CREATE_NO_WINDOW
         subprocess.Popen(
             [str(new_exe), "--skip-update-once"],
+            creationflags=relaunch_flags,
             close_fds=True,
         )
     sys.exit(0)

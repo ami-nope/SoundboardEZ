@@ -257,7 +257,8 @@ def _decode_compressed_audio_to_float32(path: Path, samplerate: int, channels: i
         str(channels),
         "pipe:1",
     ]
-    result = subprocess.run(cmd, capture_output=True)
+    result = subprocess.run(cmd, capture_output=True,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg decode failed for '{path.name}'.")
 

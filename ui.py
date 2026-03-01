@@ -77,10 +77,12 @@ from scraper import MYINSTANTS_INDEX_URL, download_via_dotnet, fetch_myinstants_
 from startup_manager import STARTUP_ARG, is_startup_enabled, set_startup_enabled
 from update_checker import UpdateInfo, check_for_update
 from updater import download_file, download_delta_files, launch_apply_and_exit
+from update_ui import UpdateWindow, create_download_worker
 from version import APP_VERSION
 
 PHI = 1.618
 SKIP_UPDATE_ONCE_ARG = "--skip-update-once"
+_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 FEED_BUTTON_STYLE = """
     QPushButton {
         border-radius: 12px;
@@ -341,7 +343,7 @@ def _convert_to_wav_ffmpeg(src: Path, dst: Path) -> bool:
     if ffmpeg_exe is None:
         return False
     cmd = [ffmpeg_exe, "-y", "-v", "error", "-i", str(src), str(dst)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, creationflags=_CREATE_NO_WINDOW)
     return result.returncode == 0 and dst.exists()
 
 
@@ -366,7 +368,7 @@ def _decode_audio_for_preview(path: Path) -> tuple[np.ndarray, int]:
             str(ch),
             "pipe:1",
         ]
-        result = subprocess.run(cmd, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True, creationflags=_CREATE_NO_WINDOW)
         if result.returncode == 0 and result.stdout:
             pcm = np.array(np.frombuffer(result.stdout, dtype=np.float32), copy=True)
             frames = pcm.size // ch
@@ -782,7 +784,7 @@ class YoutubeImportWorker(QObject):
                 "192k",
                 str(out_path),
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, creationflags=_CREATE_NO_WINDOW)
             if result.returncode != 0 or not out_path.exists():
                 raise RuntimeError("Failed to convert YouTube clip.")
 
@@ -924,7 +926,7 @@ class TrimApplyWorker(QObject):
                 "2",
                 str(trimmed_tmp),
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, creationflags=_CREATE_NO_WINDOW)
             if result.returncode != 0 or not trimmed_tmp.exists():
                 trimmed_tmp.unlink(missing_ok=True)
                 self.error.emit("ffmpeg failed to trim the audio.")
@@ -1038,6 +1040,19 @@ class StartupUpdateWorker(QObject):
                         "version": str(self.update.version),
                     }
                 )
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class _ManualUpdateCheckWorker(QObject):
+    """Runs check_for_update() off the main thread for the manual button."""
+    finished = pyqtSignal(object)   # UpdateInfo | None
+    error = pyqtSignal(str)
+
+    def run(self) -> None:
+        try:
+            result = check_for_update(APP_VERSION)
+            self.finished.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -1826,164 +1841,6 @@ class FramelessImporterDialog(QDialog):
         _apply_dwm_rounded_corners(self)
 
 
-class UpdateDialog(QDialog):
-    updateRequested = pyqtSignal()
-
-    def __init__(
-        self,
-        current_version: str,
-        new_version: str,
-        parent: QWidget | None = None,
-        mandatory: bool = False,
-    ) -> None:
-        super().__init__(parent)
-        self._busy = False
-        self._mandatory = bool(mandatory)
-        self._allow_close = not self._mandatory
-        self.setObjectName("UpdateDialog")
-        self.setWindowTitle("Update Available")
-        self.setModal(True)
-        self.setMinimumWidth(420)
-        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
-        if self._mandatory:
-            self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(18, 16, 18, 16)
-        root.setSpacing(12)
-
-        title = QLabel("Update Available")
-        title.setObjectName("UpdateTitle")
-        subtitle = QLabel(
-            f"A newer version is available.\nCurrent: {current_version}\nNew: {new_version}"
-        )
-        subtitle.setObjectName("UpdateSubtitle")
-
-        self.status_label = QLabel("Ready to update.")
-        self.status_label.setObjectName("UpdateStatus")
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setVisible(False)
-
-        button_row = QHBoxLayout()
-        button_row.setContentsMargins(0, 0, 0, 0)
-        button_row.setSpacing(10)
-        button_row.addStretch(1)
-        self.skip_button = QPushButton("Skip")
-        self.skip_button.setProperty("variant", "secondary")
-        self.update_button = QPushButton("Update")
-        self.update_button.setProperty("variant", "primary")
-        button_row.addWidget(self.skip_button)
-        button_row.addWidget(self.update_button)
-
-        root.addWidget(title)
-        root.addWidget(subtitle)
-        root.addWidget(self.status_label)
-        root.addWidget(self.progress_bar)
-        root.addLayout(button_row)
-
-        self.skip_button.clicked.connect(self.reject)
-        self.update_button.clicked.connect(self.updateRequested.emit)
-        if self._mandatory:
-            self.skip_button.setEnabled(False)
-
-        self.setStyleSheet(
-            """
-            QDialog#UpdateDialog {
-                background: rgba(22, 33, 50, 245);
-                border: 1px solid rgba(148, 163, 184, 44);
-                border-radius: 14px;
-            }
-            QLabel#UpdateTitle {
-                color: #edf3fb;
-                font-size: 18px;
-                font-weight: 600;
-            }
-            QLabel#UpdateSubtitle {
-                color: #c5d4e8;
-                font-size: 13px;
-                line-height: 1.35;
-            }
-            QLabel#UpdateStatus {
-                color: #dbe8f7;
-                font-size: 12px;
-                font-weight: 500;
-            }
-            QProgressBar {
-                background: rgba(11, 21, 36, 220);
-                border: 1px solid rgba(148, 163, 184, 44);
-                border-radius: 8px;
-                min-height: 18px;
-                color: #eaf2fb;
-                text-align: center;
-            }
-            QProgressBar::chunk {
-                background: #59d7ff;
-                border-radius: 7px;
-            }
-            """
-        )
-
-    def begin_update(self) -> None:
-        self._busy = True
-        self.update_button.setText("Update")
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
-        self.status_label.setText("Downloading update...")
-        self.update_button.setEnabled(False)
-        self.skip_button.setEnabled(False)
-
-    def set_download_progress(self, downloaded: int, total: int) -> None:
-        self.progress_bar.setVisible(True)
-        if total > 0:
-            self.progress_bar.setRange(0, total)
-            self.progress_bar.setValue(max(0, min(total, downloaded)))
-            self.status_label.setText(
-                f"Downloading update... {downloaded / (1024 * 1024):.1f}/{total / (1024 * 1024):.1f} MB"
-            )
-        else:
-            self.progress_bar.setRange(0, 0)
-            self.status_label.setText("Downloading update...")
-
-    def set_extracting(self) -> None:
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
-        self.status_label.setText("Extracting update package...")
-
-    def set_installing(self) -> None:
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
-        self.status_label.setText("Installing update and relaunching...")
-
-    def finish_success(self) -> None:
-        self._busy = False
-        self._allow_close = True
-
-    def set_error(self, message: str) -> None:
-        self._busy = False
-        self.progress_bar.setVisible(False)
-        self.status_label.setText(f"Update failed: {message}")
-        self.update_button.setText("Retry")
-        self.update_button.setEnabled(True)
-        if self._mandatory:
-            self.skip_button.setEnabled(False)
-        else:
-            self.skip_button.setEnabled(True)
-
-    def reject(self) -> None:  # type: ignore[override]
-        if self._mandatory and not self._allow_close:
-            return
-        super().reject()
-
-    def closeEvent(self, event) -> None:  # type: ignore[override]
-        if self._busy or (self._mandatory and not self._allow_close):
-            event.ignore()
-            return
-        super().closeEvent(event)
-
-
 class SoundboardWindow(QMainWindow):
     DEFAULT_KEYS = list("1234567890qwertyuiopasdfghjklzxcvbnm")
     DEFAULT_MIC_VOLUME = 60
@@ -2473,6 +2330,37 @@ class SoundboardWindow(QMainWindow):
         sidebar_layout.addItem(QSpacerItem(0, 24, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed))
         sidebar_layout.addLayout(hint_section_layout)
         sidebar_layout.addStretch(1)
+
+        # ── check-updates button ──
+        self.check_updates_btn = QPushButton("\u21BB")
+        self.check_updates_btn.setToolTip("Check for updates")
+        self.check_updates_btn.setFixedSize(34, 34)
+        self.check_updates_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.check_updates_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(64, 82, 108, 140);
+                border: 1px solid rgba(148, 163, 184, 44);
+                border-radius: 17px;
+                color: #c5d4e8;
+                font-size: 18px;
+                font-weight: 700;
+            }
+            QPushButton:hover {
+                background: rgba(89, 215, 255, 30);
+                color: #59d7ff;
+                border-color: rgba(89, 215, 255, 80);
+            }
+            QPushButton:pressed {
+                background: rgba(89, 215, 255, 50);
+            }
+        """)
+        self.check_updates_btn.clicked.connect(self._on_check_update_clicked)
+        update_btn_row = QHBoxLayout()
+        update_btn_row.setContentsMargins(0, 4, 0, 0)
+        update_btn_row.addStretch(1)
+        update_btn_row.addWidget(self.check_updates_btn)
+        update_btn_row.addStretch(1)
+        sidebar_layout.addLayout(update_btn_row)
 
         self.sidebar_scroll = QScrollArea()
         self.sidebar_scroll.setObjectName("SideScroll")
@@ -5110,6 +4998,104 @@ class SoundboardWindow(QMainWindow):
         self._volume_state.mic_gain = gain
         self.engine.set_mic_input_gain(gain)
 
+    # ── manual update check ────────────────────────────────────────────────
+
+    def _on_check_update_clicked(self) -> None:
+        self.check_updates_btn.setEnabled(False)
+        self.check_updates_btn.setToolTip("Checking…")
+        worker = _ManualUpdateCheckWorker()
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        def on_result(update: UpdateInfo | None) -> None:
+            self.check_updates_btn.setEnabled(True)
+            self.check_updates_btn.setToolTip("Check for updates")
+            if update is None:
+                QMessageBox.information(self, "SoundboardEZ", "You're on the latest version.")
+                return
+            self._start_manual_update(update)
+
+        def on_error(msg: str) -> None:
+            self.check_updates_btn.setEnabled(True)
+            self.check_updates_btn.setToolTip("Check for updates")
+            QMessageBox.warning(self, "SoundboardEZ", f"Update check failed:\n{msg}")
+
+        worker.finished.connect(on_result)
+        worker.error.connect(on_error)
+        worker.finished.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self._threads.add(thread)
+        thread.finished.connect(lambda: self._threads.discard(thread))
+        thread.start()
+
+    def _start_manual_update(self, update: UpdateInfo) -> None:
+        mandatory = bool(getattr(update, "mandatory", False))
+        win = UpdateWindow(
+            mode="update",
+            current_version=APP_VERSION,
+            new_version=str(update.version),
+            mandatory=mandatory,
+            parent=self,
+        )
+        update_dir = Path(tempfile.gettempdir())
+        running = {"value": False}
+
+        def begin() -> None:
+            if running["value"]:
+                return
+            running["value"] = True
+            worker = StartupUpdateWorker(update, update_dir)
+            thread = QThread()
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+
+            worker.stage.connect(win.set_stage)
+            worker.progress.connect(win.set_progress)
+
+            def done(payload: dict) -> None:
+                if not isinstance(payload, dict):
+                    win.set_error("Update worker returned invalid payload.")
+                    return
+                mode = str(payload.get("mode", "")).strip()
+                temp_dir = str(payload.get("temp_dir", "")).strip()
+                if not mode or not temp_dir or not Path(temp_dir).exists():
+                    win.set_error("Update payload missing or invalid.")
+                    return
+                win.set_stage("installing")
+                try:
+                    launch_apply_and_exit(mode, temp_dir, os.getpid())
+                except SystemExit:
+                    win.set_complete()
+                    win.accept()
+                except Exception as exc:
+                    win.set_error(f"Update handoff failed: {exc}")
+
+            def err(msg: str) -> None:
+                running["value"] = False
+                win.set_error(str(msg))
+
+            worker.finished.connect(done)
+            worker.error.connect(err)
+            worker.finished.connect(thread.quit)
+            worker.error.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            worker.error.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda: setattr(running, "value", False))
+
+            self._threads.add(thread)
+            thread.finished.connect(lambda: self._threads.discard(thread))
+            thread.start()
+
+        win.retry_requested.connect(begin)
+        QTimer.singleShot(0, begin)  # auto-start
+        win.exec()
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if not getattr(self, "_quitting", False) and self._tray_icon is not None and self._tray_icon.isVisible():
             event.ignore()
@@ -5210,54 +5196,49 @@ def _run_startup_auto_update(
 
     update_info = update
     update_dir = Path(tempfile.gettempdir())
-    update_dialog = UpdateDialog(APP_VERSION, update_info.version, mandatory=mandatory_update)
+    update_win = UpdateWindow(
+        mode="update",
+        current_version=APP_VERSION,
+        new_version=str(update_info.version),
+        mandatory=mandatory_update,
+    )
     update_running = {"value": False}
-    worker_ref: dict[str, QObject | None] = {"worker": None}
-    thread_ref: dict[str, QThread | None] = {"thread": None}
 
     def begin_update() -> None:
         if update_running["value"]:
             return
         update_running["value"] = True
-        update_dialog.begin_update()
+        update_win.reset_for_retry()
 
         worker = StartupUpdateWorker(update_info, update_dir)
         thread = QThread()
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.stage.connect(
-            lambda stage: update_dialog.set_extracting()
-            if str(stage).strip().lower() == "extract"
-            else None
-        )
-        worker.progress.connect(update_dialog.set_download_progress)
+
+        worker.stage.connect(update_win.set_stage)
+        worker.progress.connect(update_win.set_progress)
 
         def done(payload: dict) -> None:
             if not isinstance(payload, dict):
-                update_dialog.set_error("Update worker returned invalid payload.")
+                update_win.set_error("Update worker returned invalid payload.")
                 return
-
             mode = str(payload.get("mode", "")).strip()
             temp_dir = str(payload.get("temp_dir", "")).strip()
-            if not mode or not temp_dir:
-                update_dialog.set_error("Update payload missing mode or temp_dir.")
+            if not mode or not temp_dir or not Path(temp_dir).exists():
+                update_win.set_error("Update payload missing or invalid.")
                 return
-
-            if not Path(temp_dir).exists():
-                update_dialog.set_error(f"Update temp directory missing: {temp_dir}")
-                return
-
-            update_dialog.set_installing()
+            update_win.set_stage("installing")
             try:
                 launch_apply_and_exit(mode, temp_dir, os.getpid())
             except SystemExit:
-                update_dialog.finish_success()
-                update_dialog.accept()
+                update_win.set_complete()
+                update_win.accept()
             except Exception as exc:
-                update_dialog.set_error(f"Update handoff failed: {exc}")
+                update_win.set_error(f"Update handoff failed: {exc}")
 
         def err(message: str) -> None:
-            update_dialog.set_error(str(message))
+            update_running["value"] = False
+            update_win.set_error(str(message))
 
         worker.finished.connect(done)
         worker.error.connect(err)
@@ -5266,21 +5247,12 @@ def _run_startup_auto_update(
         worker.finished.connect(worker.deleteLater)
         worker.error.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-
-        def cleanup() -> None:
-            update_running["value"] = False
-            worker_ref["worker"] = None
-            thread_ref["thread"] = None
-
-        thread.finished.connect(cleanup)
-        worker_ref["worker"] = worker
-        thread_ref["thread"] = thread
+        thread.finished.connect(lambda: update_running.update({"value": False}))
         thread.start()
 
-    update_dialog.updateRequested.connect(begin_update)
-    if mandatory_update:
-        QTimer.singleShot(0, begin_update)
-    dialog_code = update_dialog.exec()
+    update_win.retry_requested.connect(begin_update)
+    QTimer.singleShot(0, begin_update)
+    dialog_code = update_win.exec()
     return dialog_code == QDialog.DialogCode.Accepted
 
 
